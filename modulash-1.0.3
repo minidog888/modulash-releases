@@ -1,0 +1,2716 @@
+#!/usr/bin/env bash
+# ============================================
+# Modulash Packaged Build
+# ============================================
+set -eo pipefail
+
+export MODULASH_VERSION="1.0.3"
+export MODULASH_PACKAGED=true
+export MODULASH_DEBUG_MODE=true
+# Generate vendor/autoload.sh
+generate_autoload() {
+    local target_dir="$1"
+    local sour="sour"
+    local bashc="bash"
+    cat > "$target_dir/autoload.sh" <<EOF
+# shellcheck shell=bash
+# ============================================
+# Module loader (compatible with bash 3.2)
+# ============================================
+SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+${sour}ce "\$SCRIPT_DIR/modulash/modulash.sh"
+EOF
+    chmod +x "$target_dir/autoload.sh"
+}
+# Generate vendor/modulash/modulash.sh
+generate_modulash() {
+    local target_dir="$1"
+    local sour="sour"
+    local bashc="bash"
+    cat > "$target_dir/modulash.sh" <<EOF
+# shellcheck shell=bash
+# Modulash Autoload - DO NOT EDIT
+SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+${sour}ce "\$SCRIPT_DIR/aliases.sh"
+_modulash_resolve() {
+    local spec="\$1"
+    # Remove quotes
+    spec="\${spec#\"}"; spec="\${spec%\"}"
+    spec="\${spec#\'}"; spec="\${spec%\'}"
+    if [[ "\$spec" == @* ]]; then
+        # Try longest matching alias
+        local best_alias=""
+        local best_path=""
+        local rest=""
+        for i in "\${!__MODULASH_ALIASES[@]}"; do
+            local alias="\${__MODULASH_ALIASES[\$i]}"
+            # If spec starts with alias (and alias is followed by '/' or end)
+            if [[ "\$spec" == "\$alias"/* ]] || [[ "\$spec" == "\$alias" ]]; then
+                # Choose the longest alias
+                if [[ \${#alias} -gt \${#best_alias} ]]; then
+                    best_alias="\$alias"
+                    best_path="\${__MODULASH_PATHS[\$i]}"
+                fi
+            fi
+        done
+        if [[ -n "\$best_alias" ]]; then
+            # Extract remaining part
+            if [[ "\$spec" == "\$best_alias" ]]; then
+                rest=""
+            else
+                # shellcheck disable=SC2295
+                rest="\${spec#"\$best_alias"/}"
+            fi
+            # Ensure path ends with /
+            [[ "\$best_path" != */ ]] && best_path="\$best_path/"
+            echo "\${best_path}\${rest}"
+            return 0
+        else
+            echo "Error: unknown alias (\${spec%%/*})" >&2
+            return 1
+        fi
+    else
+        # Relative path, based on caller's directory
+        local caller_dir
+        caller_dir="\$(cd "\$(dirname "\${BASH_SOURCE[1]}")" && pwd)"
+        echo "\$caller_dir/\$spec"
+        return 0
+    fi
+}
+import() {
+    local file
+    file="\$(_modulash_resolve "\$1")" || return \$?
+    if [[ ! -f "\$file" ]]; then
+        echo "Module not found: \$1 -> \$file" >&2
+        return 1
+    fi
+    # shellcheck source=/dev/null
+    ${sour}ce "\$file"
+}
+export -f import _modulash_resolve 2>/dev/null || true
+EOF
+    chmod +x "$target_dir/modulash.sh"
+}
+# Generate vendor/modulash/aliases.sh
+generate_aliases() {
+    local target_dir="$1"
+    local bashc="bash"
+    cat > "$target_dir/aliases.sh" <<EOF
+# shellcheck shell=bash
+# Modulash Aliases - DO NOT EDIT
+__MODULASH_ALIASES=(
+)
+__MODULASH_PATHS=(
+)
+EOF
+    chmod +x "$target_dir/aliases.sh"
+}
+# Generate vendor/modulash/facades.sh
+generate_facades() {
+    local target_dir="$1"
+    local bashc="bash"
+    cat > "$target_dir/facades.sh" <<EOF
+# shellcheck shell=bash
+# ============================================
+# Auto-generated Facades - DO NOT EDIT MANUALLY
+# ============================================
+#
+# Edit modulash.json to customize facades, then run dump-autoload again.
+# Example:
+#   "facade": {
+#     "info": "clish_console_log_info"      # auto-pass all arguments
+#   }
+# ============================================
+EOF
+    chmod +x "$target_dir/facades.sh"
+}
+# Main entry: generate all core bootstrap files
+generate_core() {
+    local project_dir="$1"
+    local vendor_dir="$project_dir/vendor"
+    local modulash_dir="$vendor_dir/modulash"
+    mkdir -p "$vendor_dir" "$modulash_dir"
+    generate_autoload "$vendor_dir"
+    generate_modulash "$modulash_dir"
+    generate_aliases "$modulash_dir"
+    generate_facades "$modulash_dir"
+    echo "Core bootstrap files generated in $vendor_dir"
+}
+# ============================================
+# Modulash Module Management Library
+# ============================================
+export MODULE_VENDOR_DIR="${MODULE_VENDOR_DIR:-$PWD/vendor}"
+export MODULE_COMMANDS_DIR="${MODULE_COMMANDS_DIR:-$PWD/bin/commands}"
+# ------------------------------------------------------------
+# Scripts (hooks)
+# ------------------------------------------------------------
+module_run_scripts() {
+    local event="$1"
+    local config_file="$PWD/modulash.json"
+    [[ ! -f "$config_file" ]] && return 0
+    local scripts
+    scripts=$(jq -r --arg event "$event" '.scripts[$event] // [] | .[]' "$config_file" 2>/dev/null)
+    [[ -z "$scripts" ]] && return 0
+    clish_console_core_log_info "Running scripts for event: $event"
+    local failed=0
+    while IFS= read -r cmd; do
+        echo "[RUN] $cmd"
+        if ! bash -c "$cmd"; then
+            clish_console_core_log_error "Script failed: $cmd" >&2
+            ((failed++))
+        fi
+    done <<< "$scripts"
+    if [[ $failed -gt 0 ]]; then
+        clish_console_core_log_error "$failed script(s) failed for event '$event'" >&2
+        return 1
+    fi
+    return 0
+}
+# ------------------------------------------------------------
+# Registry & version matching
+# ------------------------------------------------------------
+module_get_registry_url() {
+    local config_file="$PWD/modulash.json"
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "http://localhost:8000/api/packages"
+        return 0
+    fi
+    if [[ ! -f "$config_file" ]]; then
+        echo "http://localhost:8000/api/packages"
+        return 0
+    fi
+    jq -r '.registry.default // "http://localhost:8000/api/packages"' "$config_file"
+}
+module_match_version() {
+    local constraint="$1"
+    shift
+    local versions=("$@")
+    local best=""
+    # 处理通配符 * (如 1.*, 1.0.*)
+    if [[ "$constraint" == *"*"* ]]; then
+        local prefix="${constraint%\*}"
+        for v in "${versions[@]}"; do
+            if [[ "$v" == "$prefix"* ]]; then
+                if [[ -z "$best" ]] || [[ "$v" > "$best" ]]; then
+                    best="$v"
+                fi
+            fi
+        done
+        echo "$best"
+        return 0
+    fi
+    # 原有 ^, ~, * 和精确匹配
+    if [[ "$constraint" == ^* ]]; then
+        local base="${constraint#^}"
+        local major="${base%%.*}"
+        for v in "${versions[@]}"; do
+            if [[ "$v" == "$major"* ]] || [[ "$v" == "$major."* ]]; then
+                if [[ -z "$best" ]] || [[ "$v" > "$best" ]]; then
+                    best="$v"
+                fi
+            fi
+        done
+    elif [[ "$constraint" == ~* ]]; then
+        local base="${constraint#~}"
+        local prefix="${base%.*}"
+        for v in "${versions[@]}"; do
+            if [[ "$v" == "$prefix"* ]]; then
+                if [[ -z "$best" ]] || [[ "$v" > "$best" ]]; then
+                    best="$v"
+                fi
+            fi
+        done
+    elif [[ "$constraint" == "*" ]]; then
+        best="${versions[-1]}"
+    else
+        for v in "${versions[@]}"; do
+            if [[ "$v" == "$constraint" ]]; then
+                best="$v"
+                break
+            fi
+        done
+    fi
+    echo "$best"
+}
+# ------------------------------------------------------------
+# Lock file helpers (fixed with error checking)
+# ------------------------------------------------------------
+_read_lock_dep_version() {
+    local dep="$1"
+    local lock_file="$PWD/modulash.lock"
+    if [[ -f "$lock_file" ]]; then
+        jq -r ".dependencies.\"$dep\" // \"\"" "$lock_file" 2>/dev/null
+    else
+        echo ""
+    fi
+}
+_write_lock_dep_version() {
+    local dep="$1"
+    local version="$2"
+    local lock_file="$PWD/modulash.lock"
+    local tmp_lock="${lock_file}.tmp"
+    mkdir -p "$(dirname "$lock_file")"
+    echo "{\"dependencies\":{\"$dep\":\"$version\"}}" > "$tmp_lock"
+    if [[ -s "$tmp_lock" ]]; then
+        mv "$tmp_lock" "$lock_file"
+        clish_console_core_log_debug "Lock file written successfully" >&2
+        return 0
+    else
+        clish_console_core_log_error "Failed to write lock file" >&2
+        rm -f "$tmp_lock"
+        return 1
+    fi
+}
+# ------------------------------------------------------------
+# Install a dependency (forced version)
+# ------------------------------------------------------------
+module_install_dependency_forced() {
+    local dep_name="$1"
+    local version="$2"
+    local registry_url
+    registry_url="$(module_get_registry_url)"
+    [[ -z "$registry_url" ]] && return 1
+    module_run_scripts "pre-package-install" || true
+    local api_url="$registry_url/$dep_name"
+    local package_info
+    if ! package_info=$(curl -s "$api_url"); then
+        clish_console_core_log_error "Failed to fetch package info" >&2
+        return 1
+    fi
+    if ! echo "$package_info" | jq -e . >/dev/null 2>&1; then
+        clish_console_core_log_error "Invalid JSON" >&2
+        return 1
+    fi
+    if ! echo "$package_info" | jq -e --arg ver "$version" '.versions[] | select(.version == $ver)' >/dev/null 2>&1; then
+        clish_console_core_log_error "Version $version not found for $dep_name" >&2
+        return 1
+    fi
+    local tarball_url
+    tarball_url=$(echo "$package_info" | jq -r --arg ver "$version" '.versions[] | select(.version == $ver) | .download_url // ""')
+    [[ -z "$tarball_url" || "$tarball_url" == "null" ]] && tarball_url="$registry_url/$dep_name/download/$version"
+    local target_dir="$PWD/vendor/$dep_name"
+    mkdir -p "$PWD/vendor"
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    trap 'rm -rf "$tmp_dir"' RETURN
+    local tarball="$tmp_dir/package.tar.gz"
+    clish_console_core_log_info "Downloading $tarball_url ..." >&2
+    if ! curl -L -o "$tarball" "$tarball_url"; then
+        clish_console_core_log_error "Download failed" >&2
+        return 1
+    fi
+    if ! tar -xzf "$tarball" -C "$tmp_dir"; then
+        clish_console_core_log_error "Extraction failed" >&2
+        return 1
+    fi
+    local pkg_dir
+    pkg_dir="$(_find_pkg_dir "$tmp_dir")"
+    [[ -z "$pkg_dir" ]] && { clish_console_core_log_error "No modulash.json" >&2; return 1; }
+    mkdir -p "$target_dir"
+    cp -r "$pkg_dir"/* "$target_dir"/
+    # shellcheck disable=SC1091
+    if ! _write_lock_dep_version "$dep_name" "$version"; then
+        clish_console_core_log_warning "Failed to write lock file, but installation succeeded" >&2
+    fi
+    clish_console_core_log_success "Installed $dep_name $version" >&2
+    module_run_scripts "post-package-install" || true
+    return 0
+}
+# ------------------------------------------------------------
+# Install dependency with constraint (uses lock if exists)
+# ------------------------------------------------------------
+module_install_dependency() {
+    local dep_name="$1"
+    local constraint="$2"
+    local locked
+    locked="$(_read_lock_dep_version "$dep_name")"
+    if [[ -n "$locked" ]]; then
+        module_install_dependency_forced "$dep_name" "$locked"
+        return $?
+    fi
+    local registry_url
+    registry_url="$(module_get_registry_url)"
+    [[ -z "$registry_url" ]] && return 1
+    local api_url="$registry_url/$dep_name"
+    local package_info
+    if ! package_info=$(curl -s "$api_url"); then
+        clish_console_core_log_error "Failed to fetch package info" >&2
+        return 1
+    fi
+    if ! echo "$package_info" | jq -e . >/dev/null 2>&1; then
+        clish_console_core_log_error "Invalid JSON" >&2
+        return 1
+    fi
+    # shellcheck disable=SC2207
+    versions=($(echo "$package_info" | jq -r '.versions[].version' | sort -V))
+    [[ ${#versions[@]} -eq 0 ]] && return 1
+    local matched_version
+    matched_version="$(module_match_version "$constraint" "${versions[@]}")"
+    [[ -z "$matched_version" ]] && return 1
+    module_install_dependency_forced "$dep_name" "$matched_version"
+    return $?
+}
+# ------------------------------------------------------------
+# Helper: find package directory
+# ------------------------------------------------------------
+_find_pkg_dir() {
+    local root="$1"
+    if [[ -f "$root/modulash.json" ]]; then
+        echo "$root"
+        return 0
+    fi
+    for d in "$root"/*/; do
+        if [[ -f "$d/modulash.json" ]]; then
+            echo "$d"
+            return 0
+        fi
+    done
+    return 1
+}
+# ------------------------------------------------------------
+# Sync (install missing)
+# ------------------------------------------------------------
+module_sync_modules() {
+    if ! command -v jq >/dev/null 2>&1; then
+        clish_console_core_log_error "jq required" >&2
+        return 1
+    fi
+    local config_file="$PWD/modulash.json"
+    [[ ! -f "$config_file" ]] && { clish_console_core_log_error "modulash.json not found" >&2; return 1; }
+    module_run_scripts "pre-install" || true
+    local deps_json
+    deps_json="$(jq -r '.dependencies // {}' "$config_file")"
+    local modules
+    modules="$(jq -r 'keys[]' <<< "$deps_json")"
+    if [[ -z "$modules" ]]; then
+        clish_console_core_log_info "No dependencies found"
+        return 0
+    fi
+    clish_console_core_log_info "Installing dependencies..."
+    local failed=0
+    for mod in $modules; do
+        local constraint
+        constraint="$(jq -r ".\"$mod\"" <<< "$deps_json")"
+        if [[ -d "$PWD/vendor/$mod" ]]; then
+            clish_console_core_log_info "$mod already installed"
+            continue
+        fi
+        clish_console_core_log_info "Installing $mod ($constraint)"
+        if ! module_install_dependency "$mod" "$constraint"; then
+            clish_console_core_log_error "Failed to install $mod" >&2
+            ((failed++))
+        fi
+    done
+    module_run_scripts "post-install" || true
+    if [[ $failed -gt 0 ]]; then
+        clish_console_core_log_error "Some installs failed" >&2
+        return 1
+    fi
+    clish_console_core_log_success "All dependencies installed"
+    return 0
+}
+# ------------------------------------------------------------
+# Update (with lock)
+# ------------------------------------------------------------
+module_update_dependency() {
+    local dep_name="$1"
+    local constraint="$2"
+    local force="${3:-false}"
+    local registry_url
+    registry_url="$(module_get_registry_url)"
+    [[ -z "$registry_url" ]] && { clish_console_core_log_error "No registry URL" >&2; return 1; }
+    module_run_scripts "pre-package-install" || true
+    local api_url="$registry_url/$dep_name"
+    local package_info
+    if ! package_info=$(curl -s "$api_url"); then
+        clish_console_core_log_error "Failed to fetch package info" >&2
+        return 1
+    fi
+    if ! echo "$package_info" | jq -e . >/dev/null 2>&1; then
+        clish_console_core_log_error "Invalid JSON" >&2
+        return 1
+    fi
+    # shellcheck disable=SC2207
+    versions=($(echo "$package_info" | jq -r '.versions[].version' | sort -V))
+    [[ ${#versions[@]} -eq 0 ]] && { clish_console_core_log_error "No versions" >&2; return 1; }
+    local matched_version
+    matched_version="$(module_match_version "$constraint" "${versions[@]}")"
+    [[ -z "$matched_version" ]] && { clish_console_core_log_error "No matching version" >&2; return 1; }
+    local locked_version
+    locked_version="$(_read_lock_dep_version "$dep_name")"
+    if [[ "$force" != "true" && -n "$locked_version" && "$locked_version" == "$matched_version" ]]; then
+        clish_console_core_log_info "$dep_name locked at $locked_version (already up-to-date)"
+        module_run_scripts "post-package-install" || true
+        return 0
+    fi
+    # Download and install
+    local target_dir="$PWD/vendor/$dep_name"
+    local tarball_url
+    tarball_url=$(echo "$package_info" | jq -r --arg ver "$matched_version" '.versions[] | select(.version == $ver) | .download_url // ""')
+    [[ -z "$tarball_url" || "$tarball_url" == "null" ]] && tarball_url="$registry_url/$dep_name/download/$matched_version"
+    rm -rf "$target_dir"
+    mkdir -p "$PWD/vendor"
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    trap 'rm -rf "$tmp_dir"' RETURN
+    local tarball="$tmp_dir/package.tar.gz"
+    clish_console_core_log_info "Downloading $tarball_url ..." >&2
+    if ! curl -L -o "$tarball" "$tarball_url"; then
+        clish_console_core_log_error "Download failed" >&2
+        return 1
+    fi
+    if ! tar -xzf "$tarball" -C "$tmp_dir"; then
+        clish_console_core_log_error "Extraction failed" >&2
+        return 1
+    fi
+    local pkg_dir
+    pkg_dir="$(_find_pkg_dir "$tmp_dir")"
+    [[ -z "$pkg_dir" ]] && { clish_console_core_log_error "No modulash.json" >&2; return 1; }
+    mkdir -p "$target_dir"
+    cp -r "$pkg_dir"/* "$target_dir"/
+    # shellcheck disable=SC1091
+    if ! _write_lock_dep_version "$dep_name" "$matched_version"; then
+        clish_console_core_log_warning "Failed to write lock file, but update succeeded" >&2
+    fi
+    clish_console_core_log_success "Updated $dep_name to $matched_version" >&2
+    module_run_scripts "post-package-install" || true
+    return 0
+}
+module_update_all() {
+    local force="${1:-false}"
+    if ! command -v jq >/dev/null 2>&1; then
+        clish_console_core_log_error "jq required" >&2
+        return 1
+    fi
+    local config_file="$PWD/modulash.json"
+    [[ ! -f "$config_file" ]] && { clish_console_core_log_error "modulash.json not found" >&2; return 1; }
+    module_run_scripts "pre-update" || true
+    local deps_json
+    deps_json="$(jq -r '.dependencies // {}' "$config_file")"
+    local modules
+    modules="$(jq -r 'keys[]' <<< "$deps_json")"
+    if [[ -z "$modules" ]]; then
+        clish_console_core_log_info "No dependencies found" >&2
+        return 0
+    fi
+    clish_console_core_log_info "Updating all dependencies..." >&2
+    local failed=0
+    for mod in $modules; do
+        local constraint
+        constraint="$(jq -r ".\"$mod\"" <<< "$deps_json")"
+        if ! module_update_dependency "$mod" "$constraint" "$force"; then
+            clish_console_core_log_error "Failed to update $mod" >&2
+            ((failed++))
+        fi
+    done
+    module_run_scripts "post-update" || true
+    if [[ $failed -gt 0 ]]; then
+        clish_console_core_log_error "Some updates failed" >&2
+        return 1
+    fi
+    clish_console_core_log_success "All dependencies updated" >&2
+    return 0
+}
+# ------------------------------------------------------------
+# Install from Git/local path (compatibility)
+# ------------------------------------------------------------
+module_install_module() {
+    local source_url="$1"
+    local module_name="$2"
+    local target_dir="$PWD/vendor/$module_name"
+    if [[ -d "$target_dir" ]]; then
+        clish_console_core_log_error "Module '$module_name' already exists" >&2
+        return 1
+    fi
+    mkdir -p "$PWD/vendor"
+    if [[ -d "$source_url" ]]; then
+        cp -r "$source_url" "$target_dir"
+    elif [[ "$source_url" =~ ^https?:// ]] || [[ "$source_url" =~ \.git$ ]]; then
+        if ! command -v git >/dev/null 2>&1; then
+            clish_console_core_log_error "git is required" >&2
+            return 1
+        fi
+        git clone "$source_url" "$target_dir" || return 1
+    else
+        clish_console_core_log_error "Unsupported source format" >&2
+        return 1
+    fi
+    if [[ ! -f "$target_dir/modulash.json" ]]; then
+        clish_console_core_log_error "Source does not contain modulash.json" >&2
+        rm -rf "$target_dir"
+        return 1
+    fi
+    # shellcheck disable=SC1091
+    clish_console_core_log_success "Module '$module_name' installed successfully"
+    return 0
+}
+# ============================================
+# Command: build — Package Modulash project
+# ============================================
+cmd_build_description() {
+    echo "Package Modulash project by recursively including script files"
+}
+cmd_build_options() {
+    clish_console_core_options_option "force" "Overwrite existing output file"
+    clish_console_core_options_option "output" "Output file path (default: ./dist/modulash)" --arg
+    clish_console_core_options_option "config" "Configuration file (default: modulash.build.json)" --arg
+    clish_console_core_options_option "exclude" "Additional exclude pattern (comma-separated)" --arg
+    clish_console_core_options_option "include-dir" "Additional directories to include (comma-separated)" --arg
+    clish_console_core_options_option "include-file" "Additional files to include (comma-separated)" --arg
+    clish_console_core_options_option "entry" "Entry script file (overrides config)" --arg
+    clish_console_core_options_option "verbose" "Show detailed output"
+    clish_console_core_options_option "enable-debug" "Include --debug option in the built script"
+}
+cmd_build_handle() {
+    local output="${opt_output:-./dist/modulash}"
+    local force="${opt_force:-false}"
+    local verbose="${opt_verbose:-false}"
+    local enable_debug="${opt_enable_debug:-false}"
+    local config_file="${opt_config:-modulash.build.json}"
+    local include_dirs_opt="${opt_include_dir:-}"
+    local include_files_opt="${opt_include_file:-}"
+    local exclude_opt="${opt_exclude:-}"
+    local entry_opt="${opt_entry:-}"
+    local output_opt="${opt_output:-}"
+    local force_opt="${opt_force:-}"
+    local enable_debug_opt="${opt_enable_debug:-}"
+    local verbose_opt="${opt_verbose:-}"
+    local -a cli_include_dirs=()
+    local -a cli_include_files=()
+    local -a cli_exclude_patterns=()
+    local cli_entry=""
+    if [[ -n "$include_dirs_opt" ]]; then
+        IFS=',' read -ra cli_include_dirs <<< "$include_dirs_opt"
+    fi
+    if [[ -n "$include_files_opt" ]]; then
+        IFS=',' read -ra cli_include_files <<< "$include_files_opt"
+    fi
+    if [[ -n "$exclude_opt" ]]; then
+        IFS=',' read -ra cli_exclude_patterns <<< "$exclude_opt"
+    fi
+    [[ -n "$entry_opt" ]] && cli_entry="$entry_opt"
+    [[ -n "$output_opt" ]] && output="$output_opt"
+    [[ "$force_opt" == "true" ]] && force=true
+    [[ "$enable_debug_opt" == "true" ]] && enable_debug=true
+    [[ "$verbose_opt" == "true" ]] && verbose=true
+    local entry=""
+    local -a include_dirs=()
+    local -a include_files=()
+    local -a exclude_patterns=()
+    local config_force=false
+    if [[ -f "$config_file" ]]; then
+        entry=$(jq -r '.entry // ""' "$config_file")
+        output=$(jq -r '.output // "./dist/modulash"' "$config_file")
+        config_force=$(jq -r '.force // false' "$config_file")
+        while IFS= read -r dir; do
+            [[ -n "$dir" ]] && include_dirs+=("$dir")
+        done < <(jq -r '.include_dirs[]' "$config_file" 2>/dev/null || true)
+        while IFS= read -r file; do
+            [[ -n "$file" ]] && include_files+=("$file")
+        done < <(jq -r '.include_files[]' "$config_file" 2>/dev/null || true)
+        while IFS= read -r pat; do
+            [[ -n "$pat" ]] && exclude_patterns+=("$pat")
+        done < <(jq -r '.exclude_patterns[]' "$config_file" 2>/dev/null || true)
+    else
+        clish_console_core_log_error "Configuration file '$config_file' not found."
+        return 1
+    fi
+    [[ -n "$cli_entry" ]] && entry="$cli_entry"
+    if [[ ${#cli_include_dirs[@]} -gt 0 ]]; then
+        include_dirs=("${cli_include_dirs[@]}")
+    fi
+    if [[ ${#cli_include_files[@]} -gt 0 ]]; then
+        include_files=("${cli_include_files[@]}")
+    fi
+    if [[ ${#cli_exclude_patterns[@]} -gt 0 ]]; then
+        exclude_patterns=("${cli_exclude_patterns[@]}")
+    fi
+    [[ "$force" == "false" && "$config_force" == "true" ]] && force=true
+    local -a all_sources=()
+    for dir in "${include_dirs[@]}"; do
+        all_sources+=("$dir")
+    done
+    for file in "${include_files[@]}"; do
+        all_sources+=("$file")
+    done
+    if [[ -z "$entry" ]]; then
+        clish_console_core_log_error "No entry point specified."
+        return 1
+    fi
+    entry=$(realpath "$entry" 2>/dev/null || echo "$CLISH_CONSOLE_WORK_DIR/$entry")
+    if [[ ! -f "$entry" ]]; then
+        clish_console_core_log_error "Entry file not found: $entry"
+        return 1
+    fi
+    if [[ -f "$output" && "$force" != "true" ]]; then
+        clish_console_core_log_error "Output file '$output' exists. Use --force to overwrite."
+        return 1
+    fi
+    mkdir -p "$(dirname "$output")"
+    if [[ "$verbose" == "true" ]]; then
+        clish_console_core_log_info "Building $entry into $output ... (debug: $([[ "$enable_debug" == "true" ]] && echo "enabled" || echo "disabled"))"
+    else
+        clish_console_core_log_info "Building Modulash into $output ..."
+    fi
+    all_files=()
+    seen=()
+    _is_excluded() {
+        local file="$1"
+        local rel="${file#$CLISH_CONSOLE_WORK_DIR/}"
+        for pat in "${exclude_patterns[@]}"; do
+            if [[ "$rel" == $pat ]]; then
+                return 0
+            fi
+        done
+        return 1
+    }
+    _is_script() {
+        local file="$1"
+        [[ "$file" == *.sh || "$file" == *.bash ]] && return 0
+        local first_line
+        IFS= read -r first_line < "$file" 2>/dev/null
+        [[ "$first_line" == "#!"* ]] && return 0
+        if [[ -x "$file" ]] && command -v file >/dev/null 2>&1; then
+            file -b "$file" | grep -q "text" && return 0
+        fi
+        return 1
+    }
+    _add_file() {
+        local file="$1"
+        for seen_file in "${seen[@]}"; do
+            [[ "$seen_file" == "$file" ]] && return
+        done
+        seen+=("$file")
+        all_files+=("$file")
+    }
+    _collect_dir() {
+        local dir="$1"
+        if [[ ! -d "$dir" ]]; then
+            if [[ "$verbose" == "true" ]]; then
+                clish_console_core_log_warning "Directory not found: $dir"
+            fi
+            return
+        fi
+        while IFS= read -r file; do
+            if [[ -f "$file" ]]; then
+                if _is_excluded "$file"; then
+                    if [[ "$verbose" == "true" ]]; then
+                        clish_console_core_log_debug "Excluded: $file"
+                    fi
+                    continue
+                fi
+                if _is_script "$file"; then
+                    _add_file "$file"
+                    if [[ "$verbose" == "true" ]]; then
+                        clish_console_core_log_debug "Added: $file"
+                    fi
+                else
+                    if [[ "$verbose" == "true" ]]; then
+                        clish_console_core_log_debug "Skipping non-script: $file"
+                    fi
+                fi
+            fi
+        done < <(find "$dir" -type f | sort)
+    }
+    _collect_file() {
+        local file="$1"
+        if [[ -f "$file" ]]; then
+            if _is_excluded "$file"; then
+                if [[ "$verbose" == "true" ]]; then
+                    clish_console_core_log_debug "Excluded: $file"
+                fi
+                return
+            fi
+            if _is_script "$file"; then
+                _add_file "$file"
+                if [[ "$verbose" == "true" ]]; then
+                    clish_console_core_log_debug "Added: $file"
+                fi
+            else
+                if [[ "$verbose" == "true" ]]; then
+                    clish_console_core_log_debug "Skipping non-script: $file"
+                fi
+            fi
+        else
+            if [[ "$verbose" == "true" ]]; then
+                clish_console_core_log_debug "File not found: $file"
+            fi
+        fi
+    }
+    for src in "${all_sources[@]}"; do
+        if [[ -d "$src" ]]; then
+            abs_dir="$src"
+            [[ "$abs_dir" != /* ]] && abs_dir="$CLISH_CONSOLE_WORK_DIR/$src"
+            _collect_dir "$abs_dir"
+        else
+            abs_file="$src"
+            [[ "$abs_file" != /* ]] && abs_file="$CLISH_CONSOLE_WORK_DIR/$src"
+            _collect_file "$abs_file"
+        fi
+    done
+    _add_file "$entry"
+    if [[ "$verbose" == "true" ]]; then
+        clish_console_core_log_info "Collected ${#all_files[@]} files"
+    else
+        clish_console_core_log_info "Collected ${#all_files[@]} files"
+    fi
+    local tmp_merged=$(mktemp)
+    trap 'rm -f "$tmp_merged"' RETURN
+    for src in "${all_files[@]}"; do
+        echo >> "$tmp_merged"
+        cat "$src" >> "$tmp_merged"
+    done
+    # Read version from modulash.json
+    local version
+    if [[ -f "$CLISH_CONSOLE_WORK_DIR/modulash.json" ]]; then
+        version=$(jq -r '.version // "unknown"' "$CLISH_CONSOLE_WORK_DIR/modulash.json")
+    else
+        version="unknown"
+    fi
+    {
+        echo '#!/usr/bin/env bash'
+        echo '# ============================================'
+        echo '# Modulash Packaged Build'
+        echo '# ============================================'
+        echo 'set -eo pipefail'
+        echo ''
+        echo "export MODULASH_VERSION=\"$version\""
+        echo 'export MODULASH_PACKAGED=true'
+        if [[ "$enable_debug" == "true" ]]; then
+            echo 'export MODULASH_DEBUG_MODE=true'
+        else
+            echo 'export MODULASH_DEBUG_MODE=false'
+        fi
+        sed -E '/^#!.*bash/d' "$tmp_merged" \
+            | sed -E '/^[[:space:]]*(import|source)[[:space:]]+/d' \
+            | sed 's/\breadonly\b//g' \
+            | sed -E '/^[[:space:]]*$/d'
+    } > "$output"
+    echo >> "$output"
+    chmod +x "$output"
+    if ! bash -n "$output" 2>/dev/null; then
+        clish_console_core_log_error "Generated script has syntax errors. Please check the output."
+        bash -n "$output"
+        return 1
+    fi
+    if [[ "$verbose" == "true" ]]; then
+        clish_console_core_log_success "Build completed: $output"
+        clish_console_core_log_info "Size: $(du -h "$output" | cut -f1)"
+    else
+        clish_console_core_log_success "Build completed: $output"
+        clish_console_core_log_info "Size: $(du -h "$output" | cut -f1)"
+    fi
+}
+# ============================================
+# Command: completion — Generate shell completion scripts
+# ============================================
+cmd_completion_description() {
+    echo "Generate and optionally install shell completion scripts"
+}
+cmd_completion_options() {
+    clish_console_core_options_option "bash" "Generate Bash completion script"
+    clish_console_core_options_option "zsh" "Generate Zsh completion script"
+    clish_console_core_options_option "fish" "Generate Fish completion script"
+    clish_console_core_options_option "install" "Automatically install completion for current shell (no manual sourcing)"
+    clish_console_core_options_option "user" "Install to user directory (~/.local/share/...) instead of system directory"
+    clish_console_core_options_option "shell" "Override detected shell (bash, zsh, fish)" --arg
+}
+cmd_completion_handle() {
+    local shell="${arg_shell:-}"
+    local install="${opt_install:-false}"
+    local user="${opt_user:-false}"
+    # If --install is used, auto-detect shell and install
+    if [[ "$install" == "true" ]]; then
+        if [[ -z "$shell" ]]; then
+            # Auto-detect current shell
+            if [[ -n "$SHELL" ]]; then
+                shell="$(basename "$SHELL")"
+            else
+                # Fallback: get from process
+                shell="$(ps -p $$ -o comm= 2>/dev/null | sed 's/^-//')"
+            fi
+            if [[ -z "$shell" ]]; then
+                clish_console_core_log_error "Could not detect current shell. Please specify with --shell."
+                return 1
+            fi
+            clish_console_core_log_info "Detected shell: $shell"
+        fi
+        _auto_install_completion "$shell" "$user"
+        return $?
+    fi
+    # If shell not specified, show help
+    if [[ -z "$shell" ]]; then
+        _show_completion_help
+        return 0
+    fi
+    # Generate completion script for specified shell
+    case "$shell" in
+        bash)
+            _generate_bash_completion
+            ;;
+        zsh)
+            _generate_zsh_completion
+            ;;
+        fish)
+            _generate_fish_completion
+            ;;
+        *)
+            clish_console_core_log_error "Unsupported shell: $shell"
+            clish_console_core_log_info "Supported: bash, zsh, fish"
+            _show_completion_help
+            return 1
+            ;;
+    esac
+}
+_show_completion_help() {
+    cat <<EOF
+Usage: modulash completion <shell>
+Generate shell completion scripts for modulash commands.
+Supported shells:
+  bash   - Bash completion
+  zsh    - Zsh completion
+  fish   - Fish completion
+To enable completions, source the output in your shell profile:
+  Bash (add to ~/.bashrc):
+  Zsh (add to ~/.zshrc):
+  Fish (add to ~/.config/fish/config.fish):
+    modulash completion fish | source
+Or auto-install by detecting current shell:
+  modulash completion --install
+EOF
+}
+_generate_bash_completion() {
+    cat <<'EOF'
+_modulash_completion() {
+    local cur prev words cword
+    _init_completion || return
+    local commands
+    commands=$(modulash list-commands 2>/dev/null | awk '{print $1}')
+    if [[ $cword -eq 1 ]]; then
+        COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+        return 0
+    fi
+    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+}
+complete -F _modulash_completion modulash
+EOF
+}
+_generate_zsh_completion() {
+    cat <<'EOF'
+#compdef modulash
+_modulash() {
+    local -a commands
+    commands=(${(f)"$(modulash list-commands 2>/dev/null | awk '{print $1}')"})
+    _describe 'modulash commands' commands
+}
+compdef _modulash modulash
+EOF
+}
+_generate_fish_completion() {
+    cat <<'EOF'
+function __fish_modulash_complete_commands
+    modulash list-commands 2>/dev/null | awk '{print $1}'
+end
+complete -c modulash -f -a "(__fish_modulash_complete_commands)"
+EOF
+}
+_auto_install_completion() {
+    local shell="$1"
+    local user="${2:-false}"
+    local install_dir=""
+    local target_file=""
+    case "$shell" in
+        bash)
+            if [[ "$user" == "true" ]]; then
+                install_dir="$HOME/.local/share/bash-completion/completions"
+                mkdir -p "$install_dir"
+            else
+                install_dir="/etc/bash_completion.d"
+                if [[ ! -w "$install_dir" ]]; then
+                    clish_console_core_log_error "System directory $install_dir not writable. Try with sudo or use --user."
+                    return 1
+                fi
+            fi
+            target_file="$install_dir/modulash"
+            _generate_bash_completion | sudo tee "$target_file" >/dev/null
+            ;;
+        zsh)
+            if [[ "$user" == "true" ]]; then
+                install_dir="$HOME/.local/share/zsh/site-functions"
+                mkdir -p "$install_dir"
+            else
+                install_dir="/usr/local/share/zsh/site-functions"
+                if [[ ! -w "$install_dir" ]]; then
+                    clish_console_core_log_error "System directory $install_dir not writable. Try with sudo or use --user."
+                    return 1
+                fi
+            fi
+            target_file="$install_dir/_modulash"
+            _generate_zsh_completion | sudo tee "$target_file" >/dev/null
+            ;;
+        fish)
+            if [[ "$user" == "true" ]]; then
+                install_dir="$HOME/.config/fish/completions"
+                mkdir -p "$install_dir"
+            else
+                install_dir="/usr/share/fish/vendor_completions.d"
+                if [[ ! -w "$install_dir" ]]; then
+                    clish_console_core_log_error "System directory $install_dir not writable. Try with sudo or use --user."
+                    return 1
+                fi
+            fi
+            target_file="$install_dir/modulash.fish"
+            _generate_fish_completion | sudo tee "$target_file" >/dev/null
+            ;;
+        *)
+            clish_console_core_log_error "Unsupported shell: $shell"
+            return 1
+            ;;
+    esac
+    clish_console_core_log_success "Completion installed to $target_file"
+    if [[ "$user" == "true" ]]; then
+        clish_console_core_log_info "Restart your shell to enable completion."
+    else
+        clish_console_core_log_info "If you used sudo, you may need to restart or source the file."
+    fi
+    return 0
+}
+# ============================================
+# Command: create-project — Create a new Modulash project
+# ============================================
+# Load generator and module functions (if available)
+cmd_create-project_description() {
+    echo "Create a new Modulash project from a package in the registry"
+}
+cmd_create-project_options() {
+    clish_console_core_options_argument "package" "Package name (e.g., modkit/clish)"
+    clish_console_core_options_argument "directory" "Project directory name"
+    clish_console_core_options_argument "version" "Version constraint (default: latest)" --optional
+}
+cmd_create-project_handle() {
+    local package="${arg_package:-}"
+    local project_dir="${arg_directory:-}"
+    local version="${arg_version:-latest}"
+    if [[ -z "$package" || -z "$project_dir" ]]; then
+        clish_console_core_log_error "Missing required arguments."
+        clish_console_core_log_info "Usage: create-project <package> <directory> [version]"
+        return 1
+    fi
+    clish_console_core_log_info "Creating project from package: $package (version: $version)"
+    if [[ -d "$project_dir" ]]; then
+        clish_console_core_log_error "Directory already exists: $project_dir"
+        return 1
+    fi
+    local registry_url
+    if [[ -f "$CLISH_CONSOLE_WORK_DIR/modulash.json" ]]; then
+        registry_url=$(jq -r '.registry.default // "http://localhost:8000/api/packages"' "$CLISH_CONSOLE_WORK_DIR/modulash.json")
+    else
+        registry_url="http://localhost:8000/api/packages"
+    fi
+    clish_console_core_log_info "Using registry: $registry_url"
+    for tool in curl jq tar; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            clish_console_core_log_error "Required tool '$tool' is not installed."
+            return 1
+        fi
+    done
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    trap 'rm -rf "$tmp_dir"' RETURN
+    clish_console_core_log_info "Downloading package $package@$version ..."
+    local pkg_dir
+    if ! pkg_dir="$(_download_package "$package" "$registry_url" "$tmp_dir" "$version")"; then
+        clish_console_core_log_error "Failed to download package."
+        return 1
+    fi
+    if [[ -z "$pkg_dir" || ! -d "$pkg_dir" ]]; then
+        clish_console_core_log_error "No valid package found in downloaded archive."
+        return 1
+    fi
+    clish_console_core_log_info "Creating project in $project_dir ..."
+    mkdir -p "$project_dir"
+    cp -r "$pkg_dir"/* "$project_dir"/ 2>/dev/null || true
+    if [[ -f "$project_dir/modulash.json" ]]; then
+        _set_project_version "$project_dir/modulash.json" "1.0.0"
+    fi
+    cd "$project_dir" || return 1
+    # Generate core bootstrap files
+    if declare -f generate_core >/dev/null; then
+        clish_console_core_log_info "Generating bootstrap files..."
+        generate_core "$PWD"
+    else
+        clish_console_core_log_warning "generate_core not available; falling back to manual generation."
+        _manual_generate_aliases "$PWD"
+    fi
+    # -------------------------------------------------------------
+    # Sync dependencies (install missing modules)
+    # -------------------------------------------------------------
+    if declare -f module_sync_modules >/dev/null; then
+        clish_console_core_log_info "Installing dependencies from $PWD/modulash.json ..."
+        if module_sync_modules; then
+            clish_console_core_log_success "Dependencies installed successfully."
+        else
+            clish_console_core_log_warning "Dependency installation had issues (see above)."
+        fi
+    else
+        clish_console_core_log_warning "module_sync_modules not available; dependencies not installed."
+    fi
+    clish_console_core_log_success "Project created successfully: $project_dir"
+}
+# ----------------------------------------------------------------------
+# Fallback manual alias generation if generator functions unavailable
+# ----------------------------------------------------------------------
+_manual_generate_aliases() {
+    local target_dir="$1"
+    local config_file="$target_dir/modulash.json"
+    if [[ ! -f "$config_file" ]]; then
+        echo "Warning: $config_file not found, skipping alias generation." >&2
+        return 1
+    fi
+    local aliases_json
+    aliases_json=$(jq -r '.aliases // {}' "$config_file" 2>/dev/null || echo "{}")
+    local alias_list=""
+    local path_list=""
+    if [[ "$aliases_json" != "{}" ]]; then
+        local keys
+        keys=$(echo "$aliases_json" | jq -r 'keys[]' 2>/dev/null)
+        for key in $keys; do
+            local value
+            value=$(echo "$aliases_json" | jq -r ".\"$key\"" 2>/dev/null)
+            alias_list="$alias_list\n    \"$key\""
+            path_list="$path_list\n    \"$value\""
+        done
+    fi
+    mkdir -p "$target_dir/vendor/modulash"
+    cat > "$target_dir/vendor/modulash/aliases.sh" <<EOF
+# Modulash Aliases - Generated manually
+__MODULASH_ALIASES=(
+$alias_list
+)
+__MODULASH_PATHS=(
+$path_list
+)
+EOF
+    chmod +x "$target_dir/vendor/modulash/aliases.sh"
+    echo "Manually generated aliases.sh" >&2
+}
+# ----------------------------------------------------------------------
+# Helper: Download package from registry (debug only with -vvv)
+# ----------------------------------------------------------------------
+_download_package() {
+    local package="$1"
+    local registry="$2"
+    local dest="$3"
+    local version="$4"
+    local api_url="$registry/$package"
+    if [[ "${CLISH_CONSOLE_BOOTSTRAP_VERBOSE:-0}" -ge 3 ]]; then
+        echo "[DEBUG] Fetching package info from: $api_url" >&2
+    fi
+    local package_info
+    if ! package_info=$(curl -s "$api_url"); then
+        echo "[ERROR] Failed to fetch package info from $api_url" >&2
+        return 1
+    fi
+    if [[ "${CLISH_CONSOLE_BOOTSTRAP_VERBOSE:-0}" -ge 3 ]]; then
+        echo "[DEBUG] Received response (first 200 chars): ${package_info:0:200}..." >&2
+    fi
+    if ! echo "$package_info" | jq -e . >/dev/null 2>&1; then
+        echo "[ERROR] Invalid JSON response from registry." >&2
+        echo "$package_info" | head -c 500 >&2
+        return 1
+    fi
+    local versions_type
+    versions_type=$(echo "$package_info" | jq -r 'if .versions | type == "array" then "array" else "unknown" end')
+    if [[ "$versions_type" != "array" ]]; then
+        echo "[ERROR] Registry response: 'versions' field is not an array." >&2
+        return 1
+    fi
+    _get_download_url() {
+        echo "$1" | jq -r '.download_url // ""'
+    }
+    _get_version_str() {
+        echo "$1" | jq -r '.version'
+    }
+    _list_versions() {
+        echo "$package_info" | jq -r '.versions[].version'
+    }
+    local tarball_url=""
+    local found_version=""
+    if [[ "${CLISH_CONSOLE_BOOTSTRAP_VERBOSE:-0}" -ge 3 ]]; then
+        echo "[DEBUG] Searching for version constraint: $version" >&2
+    fi
+    if [[ "$version" == "latest" ]]; then
+        local latest_entry=$(echo "$package_info" | jq -r '.versions[-1]')
+        tarball_url=$(_get_download_url "$latest_entry")
+        found_version=$(_get_version_str "$latest_entry")
+        [[ "${CLISH_CONSOLE_BOOTSTRAP_VERBOSE:-0}" -ge 3 ]] && echo "[DEBUG] Latest version entry: $latest_entry" >&2
+    elif [[ "$version" == *"*"* ]]; then
+        local prefix="${version%\*}"
+        [[ "${CLISH_CONSOLE_BOOTSTRAP_VERBOSE:-0}" -ge 3 ]] && echo "[DEBUG] Wildcard prefix: $prefix" >&2
+        local matches=$(echo "$package_info" | jq -r --arg prefix "$prefix" '[.versions[] | select(.version | startswith($prefix))]')
+        [[ "${CLISH_CONSOLE_BOOTSTRAP_VERBOSE:-0}" -ge 3 ]] && echo "[DEBUG] Matched versions: $matches" >&2
+        if [[ "$matches" != "[]" ]]; then
+            local last_entry=$(echo "$matches" | jq -r 'last')
+            tarball_url=$(_get_download_url "$last_entry")
+            found_version=$(_get_version_str "$last_entry")
+            [[ "${CLISH_CONSOLE_BOOTSTRAP_VERBOSE:-0}" -ge 3 ]] && echo "[DEBUG] Selected version: $found_version" >&2
+        fi
+    else
+        [[ "${CLISH_CONSOLE_BOOTSTRAP_VERBOSE:-0}" -ge 3 ]] && echo "[DEBUG] Exact version match: $version" >&2
+        local entry=$(echo "$package_info" | jq -r --arg ver "$version" '.versions[] | select(.version == $ver)')
+        if [[ -n "$entry" && "$entry" != "null" ]]; then
+            tarball_url=$(_get_download_url "$entry")
+            found_version="$version"
+            [[ "${CLISH_CONSOLE_BOOTSTRAP_VERBOSE:-0}" -ge 3 ]] && echo "[DEBUG] Version entry found: $entry" >&2
+        fi
+    fi
+    if [[ -z "$found_version" ]]; then
+        echo "[ERROR] No matching version found for '$version'." >&2
+        local avail_versions=$(_list_versions | tr '\n' ' ')
+        echo "[INFO] Available versions: $avail_versions" >&2
+        return 1
+    fi
+    echo "[INFO] Selected version: $found_version" >&2
+    if [[ -z "$tarball_url" || "$tarball_url" == "null" ]]; then
+        tarball_url="$registry/$package/download/$found_version"
+        echo "[WARNING] download_url missing; using constructed URL: $tarball_url" >&2
+    else
+        [[ "${CLISH_CONSOLE_BOOTSTRAP_VERBOSE:-0}" -ge 3 ]] && echo "[DEBUG] Original download_url: $tarball_url" >&2
+    fi
+    local tarball="$dest/package.tar.gz"
+    echo "[INFO] Downloading $tarball_url ..." >&2
+    if ! curl -L -o "$tarball" "$tarball_url"; then
+        echo "[ERROR] Failed to download tarball" >&2
+        return 1
+    fi
+    if [[ "${CLISH_CONSOLE_BOOTSTRAP_VERBOSE:-0}" -ge 3 ]]; then
+        echo "[DEBUG] Downloaded tarball size: $(stat -f%z "$tarball" 2>/dev/null || stat -c%s "$tarball" 2>/dev/null) bytes" >&2
+    fi
+    if ! tar -xzf "$tarball" -C "$dest" 2>/dev/null; then
+        echo "[ERROR] Failed to extract tarball" >&2
+        return 1
+    fi
+    if [[ "${CLISH_CONSOLE_BOOTSTRAP_VERBOSE:-0}" -ge 3 ]]; then
+        echo "[DEBUG] Extracted contents of $dest:" >&2
+        ls -la "$dest" >&2
+    fi
+    local pkg_dir
+    pkg_dir="$(_find_package_dir "$dest")"
+    if [[ -n "$pkg_dir" ]]; then
+        [[ "${CLISH_CONSOLE_BOOTSTRAP_VERBOSE:-0}" -ge 3 ]] && echo "[DEBUG] Package directory found: $pkg_dir" >&2
+        echo "$pkg_dir"
+        return 0
+    else
+        echo "[ERROR] Could not find modulash.json in extracted contents" >&2
+        return 1
+    fi
+}
+# Helper: Find directory containing modulash.json
+_find_package_dir() {
+    local root="$1"
+    if [[ -f "$root/modulash.json" ]]; then
+        echo "$root"
+        return 0
+    fi
+    for d in "$root"/*/; do
+        if [[ -f "$d/modulash.json" ]]; then
+            echo "$d"
+            return 0
+        fi
+    done
+    return 1
+}
+# Helper: Set version in modulash.json
+_set_project_version() {
+    local file="$1"
+    local new_version="$2"
+    if command -v jq >/dev/null 2>&1; then
+        jq --arg v "$new_version" '.version = $v' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c "
+with open('$file', 'r') as f:
+    data = json.load(f)
+data['version'] = '$new_version'
+with open('$file', 'w') as f:
+    json.dump(data, f, indent=2)
+"
+    else
+        clish_console_core_log_warning "Cannot update version: jq or python3 not available"
+    fi
+}
+# ============================================
+# Command: dump-autoload — Generate aliases and facades
+# ============================================
+cmd_dump-autoload_description() {
+    echo "Generate aliases and facades from modulash.json"
+}
+cmd_dump-autoload_handle() {
+    local work_dir="$CLISH_CONSOLE_WORK_DIR"
+    local config_file="$work_dir/modulash.json"
+    local output_dir="$work_dir/vendor/modulash"
+    local aliases_file="$output_dir/aliases.sh"
+    local facades_file="$output_dir/facades.sh"
+    if [[ ! -f "$config_file" ]]; then
+        clish_console_core_log_error "modulash.json not found in current directory: $config_file"
+        return 1
+    fi
+    mkdir -p "$output_dir"
+    normalize_path() {
+        local path="$1"
+        if [[ "$path" == "./"* ]]; then
+            path="${path#./}"
+        fi
+        if [[ -z "$path" || "$path" == "." ]]; then
+            echo "./"
+            return
+        fi
+        path=$(echo "$path" | sed 's#//*#/#g')
+        if [[ "$path" != */ ]]; then
+            path="$path/"
+        fi
+        echo "$path"
+    }
+    local vendor_dir
+    vendor_dir=$(jq -r '.["vendor-dir"] // "./vendor"' "$config_file")
+    vendor_dir=$(normalize_path "$vendor_dir")
+    local vendor_dir_abs="$work_dir/$vendor_dir"
+    # ============================================
+    # 1. Generate aliases
+    # ============================================
+    aliases=()
+    paths=()
+    while IFS= read -r alias; do
+        [[ -z "$alias" ]] && continue
+        path=$(jq -r --arg alias "$alias" '.aliases[$alias]' "$config_file")
+        [[ -z "$path" || "$path" == "null" ]] && continue
+        path=$(normalize_path "$path")
+        aliases+=("$alias")
+        paths+=("$path")
+    done < <(jq -r '.aliases // {} | keys[]' "$config_file")
+    if [[ -d "$vendor_dir_abs" ]]; then
+        for vendor_subdir in "$vendor_dir_abs"/*/; do
+            [[ -d "$vendor_subdir" ]] || continue
+            for pkg_dir in "$vendor_subdir"/*/; do
+                local config="$pkg_dir/modulash.json"
+                [[ -f "$config" ]] || continue
+                local pkg_rel_path="${pkg_dir#$work_dir/}"
+                pkg_rel_path=$(normalize_path "$pkg_rel_path")
+                while IFS= read -r alias; do
+                    [[ -z "$alias" ]] && continue
+                    path=$(jq -r --arg alias "$alias" '.aliases[$alias]' "$config" 2>/dev/null || true)
+                    [[ -z "$path" || "$path" == "null" ]] && continue
+                    sub_path=$(normalize_path "$path")
+                    combined="${pkg_rel_path}${sub_path}"
+                    combined=$(normalize_path "$combined")
+                    aliases+=("$alias")
+                    paths+=("$combined")
+                done < <(jq -r '.aliases // {} | keys[]' "$config" 2>/dev/null || true)
+            done
+        done
+    fi
+    {
+        echo '#!/bin/bash'
+        echo '# Modulash Aliases - DO NOT EDIT'
+        echo ''
+        echo '__MODULASH_ALIASES=('
+        for a in "${aliases[@]}"; do
+            printf "    '%s'\n" "$a"
+        done
+        echo ')'
+        echo ''
+        echo '__MODULASH_PATHS=('
+        for p in "${paths[@]}"; do
+            printf "    '%s'\n" "$p"
+        done
+        echo ')'
+    } > "$aliases_file"
+    clish_console_core_log_success "Generated aliases: $aliases_file"
+    clish_console_core_log_info "Total aliases: ${#aliases[@]}"
+    # ============================================
+    # 2. Generate facades (with automatic argument passing)
+    # ============================================
+    _generate_facades() {
+        local output="$1"
+        local root="$2"
+        local user_facades
+        user_facades=$(jq -r '.facade // {} | keys[]' "$root/modulash.json" 2>/dev/null)
+        if [[ -z "$user_facades" ]]; then
+            rm -f "$output"
+            clish_console_core_log_info "No facades declared, skipped generation"
+            return
+        fi
+        {
+            echo '#!/bin/bash'
+            echo '# ============================================'
+            echo '# Auto-generated Facades - DO NOT EDIT MANUALLY'
+            echo '# ============================================'
+            echo '#'
+            echo '# Edit modulash.json to customize facades, then run dump-autoload again.'
+            echo '# Example:'
+            echo '#   "facade": {'
+            echo '#     "info": "clish_console_core_log_info"      # auto-pass all arguments'
+            echo '#   }'
+            echo '# ============================================'
+            echo ''
+            local has_any=false
+            for short in $user_facades; do
+                local body
+                body=$(jq -r --arg short "$short" '.facade[$short]' "$root/modulash.json")
+                # Validate function name
+                if [[ ! "$short" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+                    clish_console_core_log_warning "Invalid short name '$short'"
+                    continue
+                fi
+                # If body is a simple identifier (letters, digits, underscore), auto-add "$@"
+                if [[ "$body" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+                    echo "function $short() { $body \"\$@\"; }"
+                else
+                    # User provided custom body, use as-is
+                    echo "function $short() { $body; }"
+                fi
+                echo "export -f $short"
+                has_any=true
+            done
+            if [[ "$has_any" == "false" ]]; then
+                rm -f "$output"
+                clish_console_core_log_info "No valid facades found, removed generation"
+                return
+            fi
+        } > "$output"
+        clish_console_core_log_success "Generated facades: $output"
+    }
+    _generate_facades "$facades_file" "$work_dir"
+}
+cmd_init_description() {
+    echo "Initialize a new Modulash project in the current directory"
+}
+cmd_init_handle() {
+    # shellcheck source=/dev/null
+    local global_mode=false
+    local local_mode=false
+    local force=false
+    local no_interaction=false
+    local pkg_name=""
+    local description=""
+    local author=""
+    local version="1.0.0"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --global) global_mode=true; shift ;;
+            --local)  local_mode=true; shift ;;
+            --force)  force=true; shift ;;
+            --no-interaction) no_interaction=true; shift ;;
+            --name)   pkg_name="$2"; shift 2 ;;
+            --description) description="$2"; shift 2 ;;
+            --author) author="$2"; shift 2 ;;
+            --version) version="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    local target_dir
+    if $global_mode; then
+        target_dir="${MODULASH_HOME:-$HOME/.modulash}"
+    else
+        if [[ -f "modulash.json" || -f "modulash.build.json" ]]; then
+            target_dir="$PWD"
+        else
+            target_dir="$PWD"
+        fi
+    fi
+    mkdir -p "$target_dir"
+    cd "$target_dir"
+    if [[ -f "modulash.json" ]]; then
+        if [[ "$force" != true ]]; then
+            if [[ "$no_interaction" == true ]]; then
+                echo "modulash.json already exists. Use --force to overwrite." >&2
+                return 1
+            fi
+            read -p "modulash.json already exists. Overwrite? [y/N] " yn
+            if [[ ! "$yn" =~ ^[Yy]$ ]]; then
+                echo "Aborted." >&2
+                return 0
+            fi
+        fi
+    fi
+    # Interactive collection
+    if [[ "$no_interaction" == false ]]; then
+        local default_vendor="my"
+        local default_name=$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
+        [[ -z "$default_name" ]] && default_name="module"
+        if [[ -z "$pkg_name" ]]; then
+            read -p "Package name (<vendor>/<name>) [$default_vendor/$default_name]: " input_name
+            pkg_name="${input_name:-$default_vendor/$default_name}"
+        fi
+        if [[ ! "$pkg_name" =~ ^[a-z0-9_-]+/[a-z0-9_-]+$ ]]; then
+            echo "Error: Package name must be in format vendor/name (lowercase, alphanumeric, - and _ allowed)." >&2
+            return 1
+        fi
+        if [[ -z "$description" ]]; then
+            read -p "Description: " description
+        fi
+        if [[ -z "$author" ]]; then
+            local git_name=$(git config --global user.name 2>/dev/null || echo "")
+            local git_email=$(git config --global user.email 2>/dev/null || echo "")
+            if [[ -n "$git_name" && -n "$git_email" ]]; then
+                default_author="$git_name <$git_email>"
+            else
+                default_author="Your Name <you@example.com>"
+            fi
+            read -p "Author [$default_author]: " input_author
+            author="${input_author:-$default_author}"
+        fi
+        if [[ -z "$version" ]]; then
+            read -p "Version [1.0.0]: " input_version
+            version="${input_version:-1.0.0}"
+        fi
+    else
+        [[ -z "$pkg_name" ]] && pkg_name="my/$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+        [[ -z "$description" ]] && description=""
+        [[ -z "$author" ]] && author="$(git config --global user.name 2>/dev/null) <$(git config --global user.email 2>/dev/null)>" || author="Your Name <you@example.com>"
+        [[ -z "$version" ]] && version="1.0.0"
+    fi
+    # Extract author email for maintainers (if present)
+    local author_email="${author##*<}"
+    author_email="$(echo "$author_email" | sed 's/>.*$//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ -z "$author_email" ]] && author_email=""
+    # Build maintainers array (single element, can be extended later)
+    local maintainers_json="[]"
+    if [[ -n "$author_email" ]]; then
+        maintainers_json="[\"$author_email\"]"
+    fi
+    cat > modulash.json <<EOF
+{
+  "name": "$pkg_name",
+  "version": "$version",
+  "description": "$description",
+  "author": "$author",
+  "maintainers": $maintainers_json,
+  "keywords": [],
+  "dependencies": {},
+  "aliases": {
+    "@": "./",
+    "@cmd": "./bin/commands"
+  },
+  "facade": {},
+  "devDependencies": [],
+  "optionalDependencies": [],
+  "registry": {
+    "default": "http://localhost:8000/api/packages",
+    "fallback": "./modules",
+    "local": "./modules"
+  }
+}
+EOF
+    echo "Created modulash.json"
+    generate_core "$PWD"
+    echo "Modulash project initialized successfully in $(pwd)"
+}
+# ============================================
+# Command: install — Install Modulash project and dependencies
+# ============================================
+cmd_install_description() {
+    echo "Install Modulash project: check environment, download dependencies, initialize"
+}
+cmd_install_options() {
+    clish_console_core_options_option "force" "Force re-install even if already installed"
+}
+cmd_install_handle() {
+    local force="${opt_force:-false}"
+    local lock_file="$CLISH_CONSOLE_WORK_DIR/modulash.lock"
+    # Check if already installed
+    if [[ -f "$lock_file" && "$force" != "true" ]]; then
+        clish_console_core_log_error "Project already installed (modulash.lock exists). Use --force to re-install."
+        return 1
+    fi
+    clish_console_core_log_info "Starting Modulash installation..."
+    # ============================================
+    # Environment check
+    # ============================================
+    check_environment() {
+        clish_console_core_log_info "Checking system dependencies..."
+        local -a missing=()
+        for cmd in jq git curl tar; do
+            if ! command -v "$cmd" &>/dev/null; then
+                missing+=("$cmd")
+            fi
+        done
+        if [[ ${#missing[@]} -gt 0 ]]; then
+            clish_console_core_log_warning "Missing dependencies: ${missing[*]}"
+            # For simplicity, we just warn and continue (no auto-install in this version)
+            clish_console_core_log_info "Please install missing dependencies manually: ${missing[*]}"
+            return 1
+        else
+            clish_console_core_log_success "All system dependencies are present."
+        fi
+    }
+    check_environment || return 1
+    # ============================================
+    # Validate modulash.json
+    # ============================================
+    if [[ ! -f "$CLISH_CONSOLE_WORK_DIR/modulash.json" ]]; then
+        clish_console_core_log_error "modulash.json not found in current directory."
+        return 1
+    fi
+    clish_console_core_log_success "Found modulash.json"
+    # ============================================
+    # Create directory structure
+    # ============================================
+    clish_console_core_log_info "Creating directory structure..."
+    mkdir -p "$CLISH_CONSOLE_WORK_DIR/vendor"
+    mkdir -p "$CLISH_CONSOLE_WORK_DIR/bin/commands"
+    mkdir -p "$CLISH_CONSOLE_WORK_DIR/lib"
+    clish_console_core_log_success "Directories created."
+    # ============================================
+    # Generate core bootstrap files
+    # ============================================
+    if declare -f generate_core >/dev/null; then
+        clish_console_core_log_info "Generating bootstrap files..."
+        generate_core "$CLISH_CONSOLE_WORK_DIR"
+    else
+        clish_console_core_log_warning "generate_core not available; skipping bootstrap generation."
+    fi
+    # ============================================
+    # Install dependencies using module_sync_modules
+    # ============================================
+    if declare -f module_sync_modules >/dev/null; then
+        # Run pre-install hook
+        if declare -f module_run_scripts >/dev/null; then
+            module_run_scripts "pre-install" || clish_console_core_log_warning "Pre-install scripts failed."
+        fi
+        clish_console_core_log_info "Installing dependencies..."
+        if (cd "$CLISH_CONSOLE_WORK_DIR" && module_sync_modules); then
+            clish_console_core_log_success "Dependencies installed."
+        else
+            clish_console_core_log_error "Dependency installation failed."
+            return 1
+        fi
+        # Run post-install hook
+        if declare -f module_run_scripts >/dev/null; then
+            module_run_scripts "post-install" || clish_console_core_log_warning "Post-install scripts failed."
+        fi
+    else
+        clish_console_core_log_warning "module_sync_modules not available; dependencies not installed."
+        clish_console_core_log_info "Please run 'modulash require <package>' manually."
+    fi
+    # ============================================
+    # Create lock file
+    # ============================================
+    touch "$lock_file"
+    clish_console_core_log_success "Installation completed successfully."
+}
+# ============================================
+# Command: require — Add a dependency to modulash.json and install it
+# ============================================
+cmd_require_description() {
+    echo "Add a dependency to modulash.json and install it"
+}
+cmd_require_options() {
+    clish_console_core_options_option "dev" "Add to devDependencies instead of dependencies"
+    clish_console_core_options_option "dry-run" "Preview changes without modifying files"
+    clish_console_core_options_option "force" "Force install even if already installed"
+    clish_console_core_options_argument "package" "Package name (vendor/name)"
+    clish_console_core_options_argument "version" "Version constraint (default: *)" --optional
+}
+cmd_require_handle() {
+    local dev="${opt_dev:-false}"
+    local dry_run="${opt_dry_run:-false}"
+    local force="${opt_force:-false}"
+    local package="${arg_package:-}"
+    local version="${arg_version:-*}"
+    if [[ -z "$package" ]]; then
+        clish_console_core_log_error "Package name is required."
+        clish_console_core_log_info "Usage: require <package> [version]"
+        return 1
+    fi
+    if [[ ! "$package" =~ ^[a-z0-9_-]+/[a-z0-9_-]+$ ]]; then
+        clish_console_core_log_error "Invalid package name format. Use vendor/name."
+        return 1
+    fi
+    clish_console_core_log_info "Requiring $package ($version)"
+    local registry_url
+    registry_url="$(module_get_registry_url)"
+    if [[ -z "$registry_url" ]]; then
+        clish_console_core_log_error "No registry URL configured."
+        return 1
+    fi
+    local api_url="$registry_url/$package"
+    local package_info
+    if ! package_info=$(curl -s "$api_url"); then
+        clish_console_core_log_error "Failed to fetch package info from $api_url"
+        return 1
+    fi
+    if ! echo "$package_info" | jq -e . >/dev/null 2>&1; then
+        clish_console_core_log_error "Invalid response from registry"
+        return 1
+    fi
+    local versions
+    versions=($(echo "$package_info" | jq -r '.versions[].version' | sort -V))
+    if [[ ${#versions[@]} -eq 0 ]]; then
+        clish_console_core_log_error "No versions available for $package"
+        return 1
+    fi
+    local matched_version
+    matched_version="$(module_match_version "$version" "${versions[@]}")"
+    if [[ -z "$matched_version" ]]; then
+        clish_console_core_log_error "No version matches constraint '$version'"
+        return 1
+    fi
+    clish_console_core_log_info "Selected version: $matched_version"
+    if [[ -d "$CLISH_CONSOLE_WORK_DIR/vendor/$package" ]] && [[ "$force" != "true" ]]; then
+        clish_console_core_log_warning "Package $package already installed. Use --force to reinstall."
+    fi
+    if [[ "$dry_run" == "true" ]]; then
+        clish_console_core_log_info "Dry-run: would add $package $matched_version to $([[ "$dev" == "true" ]] && echo "devDependencies" || echo "dependencies") and install it"
+        return 0
+    fi
+    local config_file="$CLISH_CONSOLE_WORK_DIR/modulash.json"
+    if [[ ! -f "$config_file" ]]; then
+        clish_console_core_log_error "modulash.json not found. Run 'modulash init' first."
+        return 1
+    fi
+    local tmp_json="${config_file}.tmp"
+    local dep_key
+    if [[ "$dev" == "true" ]]; then
+        dep_key="devDependencies"
+    else
+        dep_key="dependencies"
+    fi
+    if ! jq --arg key "$dep_key" --arg pkg "$package" --arg ver "$matched_version" \
+        '.[$key][$pkg] = $ver' "$config_file" > "$tmp_json"; then
+        clish_console_core_log_error "Failed to update modulash.json"
+        return 1
+    fi
+    mv "$tmp_json" "$config_file"
+    clish_console_core_log_success "Added $package to $dep_key"
+    clish_console_core_log_info "Installing $package ..."
+    if ! module_install_dependency "$package" "$matched_version"; then
+        clish_console_core_log_error "Installation failed, rolling back modulash.json..."
+        jq --arg key "$dep_key" --arg pkg "$package" '.[$key] |= del(.[$pkg])' "$config_file" > "$tmp_json"
+        mv "$tmp_json" "$config_file"
+        return 1
+    fi
+    clish_console_core_log_success "Package $package installed successfully."
+    return 0
+}
+# ============================================
+# Command: self-update — Update Modulash itself
+# ============================================
+DEFAULT_UPDATE_URL="https://raw.githubusercontent.com/minidog888/modulash-releases/main/versions.json"
+FALLBACK_UPDATE_URL="https://gitee.com/minidog888/modulash-releases/raw/main/releases/versions.json"
+cmd_self-update_description() {
+    echo "Update Modulash to the latest version"
+}
+cmd_self-update_options() {
+    clish_console_core_options_option "dry-run" "Preview the update without applying"
+    clish_console_core_options_option "force" "Force update even if same version"
+    clish_console_core_options_option "rollback" "Rollback to the previous version"
+    clish_console_core_options_option "stable" "Update to latest stable (default)"
+    clish_console_core_options_option "preview" "Update to latest preview version"
+    clish_console_core_options_option "update-url" "Custom update metadata URL" --arg
+    clish_console_core_options_option "file" "Install from a local file instead of downloading" --arg
+    clish_console_core_options_option "debug" "Print debug information"
+}
+cmd_self-update_handle() {
+    local dry_run="${opt_dry_run:-false}"
+    local force="${opt_force:-false}"
+    local rollback="${opt_rollback:-false}"
+    local channel="${opt_channel:-stable}"
+    local version="${arg_version:-}"
+    local update_url="${opt_update_url:-}"
+    local local_file="${opt_file:-}"
+    local debug="${opt_debug:-false}"
+    local script_path
+    script_path="$(readlink -f "$0")"
+    if [[ ! -w "$script_path" ]]; then
+        clish_console_core_log_error "No write permission for $script_path. Try with sudo."
+        return 1
+    fi
+    if [[ "$rollback" == "true" ]]; then
+        _do_rollback "$script_path"
+        return $?
+    fi
+    if [[ -n "$local_file" ]]; then
+        if [[ ! -f "$local_file" ]]; then
+            clish_console_core_log_error "Local file not found: $local_file"
+            return 1
+        fi
+        if [[ "$dry_run" == "true" ]]; then
+            clish_console_core_log_info "Dry-run: would replace with $local_file"
+            return 0
+        fi
+        _install_local_file "$local_file" "$script_path"
+        return $?
+    fi
+    for cmd in curl jq; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            clish_console_core_log_error "Required tool '$cmd' is not installed."
+            return 1
+        fi
+    done
+    local current_version="${MODULASH_VERSION:-unknown}"
+    clish_console_core_log_info "Current version: $current_version"
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    trap 'rm -rf "$tmp_dir"' RETURN
+    local meta_file="$tmp_dir/versions.json"
+    # Try primary update URL, fallback to secondary
+    local urls_to_try=()
+    if [[ -n "$update_url" ]]; then
+        urls_to_try+=("$update_url")
+    else
+        urls_to_try+=("$DEFAULT_UPDATE_URL")
+        urls_to_try+=("$FALLBACK_UPDATE_URL")
+    fi
+    local meta_fetched=false
+    for url in "${urls_to_try[@]}"; do
+        if [[ "$debug" == "true" ]]; then
+            echo "[DEBUG] Trying to fetch metadata from: $url" >&2
+        fi
+        if curl -s -L --connect-timeout 5 --retry 2 "$url" -o "$meta_file"; then
+            meta_fetched=true
+            break
+        fi
+    done
+    if [[ "$meta_fetched" != "true" ]]; then
+        clish_console_core_log_error "Failed to fetch version metadata from any source."
+        return 1
+    fi
+    if [[ "$debug" == "true" ]]; then
+        echo "[DEBUG] Downloaded metadata:" >&2
+        cat "$meta_file" >&2
+    fi
+    if ! jq -e . "$meta_file" >/dev/null 2>&1; then
+        clish_console_core_log_error "Invalid JSON from update source"
+        return 1
+    fi
+    local latest_version download_url sha256 sig_url
+    if [[ "$channel" == "stable" ]]; then
+        latest_version=$(jq -r '.stable.version // ""' "$meta_file")
+        download_url=$(jq -r '.stable.download_url // ""' "$meta_file")
+        sha256=$(jq -r '.stable.sha256 // ""' "$meta_file")
+        sig_url=$(jq -r '.stable.signature_url // ""' "$meta_file")
+    elif [[ "$channel" == "preview" ]]; then
+        latest_version=$(jq -r '.preview.version // ""' "$meta_file")
+        download_url=$(jq -r '.preview.download_url // ""' "$meta_file")
+        sha256=$(jq -r '.preview.sha256 // ""' "$meta_file")
+        sig_url=$(jq -r '.preview.signature_url // ""' "$meta_file")
+    fi
+    if [[ -z "$latest_version" || -z "$download_url" ]]; then
+        clish_console_core_log_error "No version found for channel '$channel'"
+        return 1
+    fi
+    clish_console_core_log_info "Latest version: $latest_version"
+    if [[ "$force" != "true" && "$current_version" == "$latest_version" ]]; then
+        clish_console_core_log_info "Already up-to-date (version $current_version). Use --force to reinstall."
+        return 0
+    fi
+    if [[ "$dry_run" == "true" ]]; then
+        clish_console_core_log_info "Dry-run: would download $download_url and replace $script_path"
+        return 0
+    fi
+    local new_file="$tmp_dir/modulash-new.sh"
+    clish_console_core_log_info "Downloading $download_url ..."
+    if ! curl -s -L --connect-timeout 5 --retry 2 "$download_url" -o "$new_file"; then
+        clish_console_core_log_error "Download failed"
+        return 1
+    fi
+    if [[ -n "$sha256" && "$sha256" != "null" ]]; then
+        local actual_sha
+        actual_sha="$(sha256sum "$new_file" | awk '{print $1}')"
+        if [[ "$actual_sha" != "$sha256" ]]; then
+            clish_console_core_log_error "SHA256 mismatch: expected $sha256, got $actual_sha"
+            return 1
+        fi
+    fi
+    if [[ -n "$sig_url" && "$sig_url" != "null" ]]; then
+        if ! command -v gpg >/dev/null 2>&1; then
+            clish_console_core_log_warning "gpg not available; skipping signature verification"
+        else
+            local sig_file="$tmp_dir/modulash.sig"
+            if curl -s -L --connect-timeout 5 --retry 2 "$sig_url" -o "$sig_file"; then
+                if ! gpg --verify "$sig_file" "$new_file" 2>/dev/null; then
+                    clish_console_core_log_error "GPG signature verification failed. Aborting."
+                    return 1
+                else
+                    clish_console_core_log_success "GPG signature verified"
+                fi
+            else
+                clish_console_core_log_warning "Failed to download signature; skipping verification"
+            fi
+        fi
+    fi
+    _install_local_file "$new_file" "$script_path"
+    return 1
+}
+# ------------------------------------------------------------
+# Helper functions
+# ------------------------------------------------------------
+_install_local_file() {
+    local src="$1"
+    local dst="$2"
+    local backup_dir="$HOME/.modulash-backups"
+    mkdir -p "$backup_dir"
+    local backup_name="modulash.backup.$(date +%Y%m%d_%H%M%S)"
+    local backup_path="$backup_dir/$backup_name"
+    cp "$dst" "$backup_path"
+    clish_console_core_log_info "Backed up current version to $backup_path"
+    _clean_old_backups "$backup_dir"
+    if ! cp "$src" "$dst"; then
+        clish_console_core_log_error "Failed to replace $dst. Restoring backup..."
+        cp "$backup_path" "$dst"
+        return 1
+    fi
+    chmod +x "$dst"
+    clish_console_core_log_success "Updated successfully. Please run 'modulash' again to use the new version."
+    return 0
+}
+_clean_old_backups() {
+    local backup_dir="$1"
+    local count
+    count="$(ls -1 "$backup_dir"/modulash.backup.* 2>/dev/null | wc -l)"
+    if [[ "$count" -gt 5 ]]; then
+        ls -1 "$backup_dir"/modulash.backup.* | head -n $((count - 5)) | while read -r old; do
+            rm -f "$old"
+        done
+    fi
+}
+_do_rollback() {
+    local script_path="$1"
+    local backup_dir="$HOME/.modulash-backups"
+    local latest_backup
+    latest_backup="$(ls -1 "$backup_dir"/modulash.backup.* 2>/dev/null | tail -1)"
+    if [[ -z "$latest_backup" ]]; then
+        clish_console_core_log_error "No backup found to rollback."
+        return 1
+    fi
+    clish_console_core_log_info "Rolling back to $(basename "$latest_backup")"
+    if ! cp "$latest_backup" "$script_path"; then
+        clish_console_core_log_error "Failed to restore backup."
+        return 1
+    fi
+    chmod +x "$script_path"
+    clish_console_core_log_success "Rollback successful. Please run 'modulash' again."
+    return 0
+}
+# ============================================
+# Command: update — Update project dependencies
+# ============================================
+cmd_update_description() {
+    echo "Update project dependencies to the latest compatible versions"
+}
+cmd_update_options() {
+    clish_console_core_options_option "dry-run" "Preview updates without actually downloading"
+    clish_console_core_options_option "force" "Force re-install even if already up-to-date"
+}
+cmd_update_handle() {
+    local dry_run="${opt_dry_run:-false}"
+    local force="${opt_force:-false}"
+    if [[ "$dry_run" == "true" ]]; then
+        clish_console_core_log_info "Dry-run mode: checking for available updates..."
+        clish_console_core_log_info "Dry-run not fully implemented; use --force to actually update."
+        return 0
+    fi
+    clish_console_core_log_info "Updating project dependencies..."
+    (cd "$CLISH_CONSOLE_WORK_DIR" && module_update_all "$force") || {
+        clish_console_core_log_error "Update failed."
+        return 1
+    }
+    clish_console_core_log_success "Update completed successfully."
+    return 0
+}
+# shellcheck shell=bash
+# ============================================
+# Module loader (compatible with bash 3.2)
+# ============================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+# ============================================
+# Clish Console Bootstrap (Strict Namespaced)
+# ============================================
+# Public function to check if running in packaged mode
+clish_console_is_packaged() {
+    [[ "${MODULASH_PACKAGED:-false}" == "true" ]]
+}
+# If not set, default to false (development mode)
+export CLISH_CONSOLE_PACKAGED="${MODULASH_PACKAGED:-false}"
+export CLISH_CONSOLE_WORK_DIR="${MODULASH_WORK_DIR:-$PWD}"
+# Entry point (public API)
+clish_console_bootstrap_main() {
+    local CLISH_CONSOLE_BOOTSTRAP_QUIET=false
+    local CLISH_CONSOLE_BOOTSTRAP_VERBOSE=0
+    local CLISH_CONSOLE_BOOTSTRAP_GLOBAL_HELP=false
+    local CLISH_CONSOLE_BOOTSTRAP_SHOW_VERSION=false
+    local CLISH_CONSOLE_BOOTSTRAP_NO_INTERACTION=false
+    local CLISH_CONSOLE_BOOTSTRAP_DEBUG=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -V|--version) CLISH_CONSOLE_BOOTSTRAP_SHOW_VERSION=true; shift ;;
+            -h|--help) CLISH_CONSOLE_BOOTSTRAP_GLOBAL_HELP=true; shift ;;
+            -q|--quiet) CLISH_CONSOLE_BOOTSTRAP_QUIET=true; shift ;;
+            -vvv) CLISH_CONSOLE_BOOTSTRAP_VERBOSE=3; shift ;;
+            -vv) CLISH_CONSOLE_BOOTSTRAP_VERBOSE=2; shift ;;
+            -v|--verbose) ((CLISH_CONSOLE_BOOTSTRAP_VERBOSE++)); shift ;;
+            --ansi|--no-ansi) shift ;;
+            -n|--no-interaction) CLISH_CONSOLE_BOOTSTRAP_NO_INTERACTION=true; shift ;;
+            --env) shift 2 ;;
+            --debug)
+                if [[ -n "${CLISH_CONSOLE_CLOSE_DEBUG_ENABLED:-}" ]]; then
+                    echo "Error: --debug is not enabled in this build" >&2
+                    exit 1
+                fi
+                CLISH_CONSOLE_BOOTSTRAP_DEBUG=true
+                shift
+                ;;
+            --) shift; break ;;
+            -*|*) break ;;
+        esac
+    done
+    export CLISH_CONSOLE_BOOTSTRAP_QUIET
+    export CLISH_CONSOLE_BOOTSTRAP_VERBOSE
+    export CLISH_CONSOLE_BOOTSTRAP_NO_INTERACTION
+    export CLISH_CONSOLE_BOOTSTRAP_DEBUG
+    if [[ "$CLISH_CONSOLE_BOOTSTRAP_DEBUG" == "true" ]]; then
+        set -x
+        export PS4='+ [${BASH_SOURCE}:${LINENO}] '
+    fi
+    if [[ "$CLISH_CONSOLE_BOOTSTRAP_SHOW_VERSION" == "true" ]]; then
+        clish_console_console_help_show_version
+        exit 0
+    fi
+    if [[ "$CLISH_CONSOLE_BOOTSTRAP_GLOBAL_HELP" == "true" || $# -eq 0 ]]; then
+        clish_console_console_help_show_global_help
+        exit 0
+    fi
+    clish_console_console_kernel_run_command "$@"
+}
+# ============================================
+# Clish Console Help (Strict Namespaced)
+# ============================================
+clish_console_console_help_get_version() {
+    if [[ -f "$PROJECT_ROOT/modulash.json" ]]; then
+        jq -r '.version // "1.0.0"' "$PROJECT_ROOT/modulash.json" 2>/dev/null || echo "1.0.0"
+    else
+        echo "1.0.0"
+    fi
+}
+clish_console_console_help_show_version() {
+    if [[ "$CLISH_CONSOLE_CORE_INIT_QUIET" == "true" ]]; then
+        return
+    fi
+    local version
+    version="$(clish_console_console_help_get_version)"
+    echo "Clish Console version ${version}"
+}
+_clish_console_console_help_list_commands() {
+    if [[ "$CLISH_CONSOLE_CORE_INIT_QUIET" == "true" ]]; then
+        return
+    fi
+    local -a cmd_paths=()
+    # ---------- distinguish packaged vs development ----------
+    if clish_console_is_packaged; then
+        # Packaged mode: all commands are already functions
+        local funcs
+        funcs=$(declare -f | grep -E '^cmd_[a-zA-Z0-9_-]+_handle' | sed 's/^cmd_//;s/_handle.*//')
+        for ns in $funcs; do
+            local path="${ns//_//}"
+            cmd_paths+=("$path")
+        done
+    else
+        # Development mode: check file permissions and read executability
+        if [[ ${#CLISH_CONSOLE_CONSOLE_KERNEL_COMMAND_PATHS[@]} -gt 0 ]]; then
+            for candidate in "${CLISH_CONSOLE_CONSOLE_KERNEL_COMMAND_PATHS[@]}"; do
+                local file="$CLISH_CONSOLE_CONSOLE_KERNEL_BIN_DIR/$candidate"
+                # Check existence and readability (needed to source later)
+                if [[ ! -f "$file" ]]; then
+                    echo "Warning: '$file' is not a regular file. Skipping." >&2
+                    continue
+                fi
+                if [[ ! -r "$file" ]]; then
+                    echo "Warning: '$file' is not readable. Skipping." >&2
+                    continue
+                fi
+                # Warn about missing execute permission, but still show the command
+                if [[ ! -x "$file" ]]; then
+                    echo "Warning: '$file' is not executable. Check permissions." >&2
+                fi
+                cmd_paths+=("$candidate")
+            done
+        # If no paths provided in development mode, result will be empty
+        fi
+    fi
+    if [[ ${#cmd_paths[@]} -eq 0 ]]; then
+        echo "  (no commands found)"
+        return
+    fi
+    # Sort paths using while read loop to avoid SC2207
+    local sorted_cmds=()
+    while IFS= read -r line; do
+        sorted_cmds+=("$line")
+    done < <(printf "%s\n" "${cmd_paths[@]}" | sort)
+    cmd_paths=("${sorted_cmds[@]}")
+    local -a ungrouped=()
+    local -a grouped_paths=()
+    local -a grouped_groups=()
+    for path in "${cmd_paths[@]}"; do
+        if [[ "$path" == */* ]]; then
+            local group="${path%%/*}"
+            grouped_paths+=("$path")
+            grouped_groups+=("$group")
+        else
+            ungrouped+=("$path")
+        fi
+    done
+    # Helper to get description depending on mode
+    _get_cmd_description() {
+        local cmd_name="$1"
+        local ns="cmd_${cmd_name//\//_}"
+        if clish_console_is_packaged; then
+            # In packaged mode functions are already in memory
+            if declare -f "${ns}_description" >/dev/null; then
+                "${ns}_description"
+            fi
+        else
+            # Development mode: source the file (we already know it's readable)
+            local file="$CLISH_CONSOLE_CONSOLE_KERNEL_BIN_DIR/$cmd_name"
+            if [[ -f "$file" ]]; then
+                # shellcheck source=/dev/null
+                if declare -f "${ns}_description" >/dev/null; then
+                    "${ns}_description"
+                fi
+            fi
+        fi
+    }
+    # Print ungrouped commands
+    for cmd in "${ungrouped[@]}"; do
+        local desc
+        desc="$(_get_cmd_description "$cmd")"
+        printf "    %-24s %s\n" "$cmd" "$desc"
+    done
+    [[ ${#ungrouped[@]} -gt 0 ]] && echo
+    if [[ ${#grouped_paths[@]} -eq 0 ]]; then
+        return
+    fi
+    local -a unique_groups=()
+    for grp in "${grouped_groups[@]}"; do
+        local found=0
+        for ug in "${unique_groups[@]}"; do
+            [[ "$ug" == "$grp" ]] && found=1 && break
+        done
+        [[ $found -eq 0 ]] && unique_groups+=("$grp")
+    done
+    for grp in "${unique_groups[@]}"; do
+        echo -e "  ${CLISH_CONSOLE_CORE_INIT_COLOR_CYAN}${grp}${CLISH_CONSOLE_CORE_INIT_COLOR_RESET}"
+        for i in "${!grouped_paths[@]}"; do
+            if [[ "${grouped_groups[$i]}" == "$grp" ]]; then
+                local full_path="${grouped_paths[$i]}"
+                local display="${full_path//\//:}"
+                local desc
+                desc="$(_get_cmd_description "$full_path")"
+                printf "    %-24s %s\n" "$display" "$desc"
+            fi
+        done
+        echo
+    done
+}
+clish_console_console_help_show_global_help() {
+    if [[ "$CLISH_CONSOLE_CORE_INIT_QUIET" == "true" ]]; then
+        return
+    fi
+    local version
+    version="$(clish_console_console_help_get_version)"
+    cat <<'BANNER'
+ ___    _             _     
+(  _`\ (_ )  _       ( )    
+| ( (_) | | (_)  ___ | |__  
+| |  _  | | | |/',__)|  _ `\
+| (_( ) | | | |\__, \| | | |
+(____/'(___)(_)(____/(_) (_)
+BANNER
+    echo
+    echo "Clish Console version ${version}  $(date -u +"%Y-%m-%d %H:%M:%S")"
+    echo
+    echo "Usage:"
+    echo "  $0 [options] <command> [arguments]"
+    echo
+    echo "Options:"
+    printf "  ${CLISH_CONSOLE_CORE_INIT_COLOR_GREEN}%-28s${CLISH_CONSOLE_CORE_INIT_COLOR_RESET} %s\n" "-h, --help" "Display help for the given command"
+    printf "  ${CLISH_CONSOLE_CORE_INIT_COLOR_GREEN}%-28s${CLISH_CONSOLE_CORE_INIT_COLOR_RESET} %s\n" "-q, --quiet" "Do not output any message"
+    printf "  ${CLISH_CONSOLE_CORE_INIT_COLOR_GREEN}%-28s${CLISH_CONSOLE_CORE_INIT_COLOR_RESET} %s\n" "-V, --version" "Display this application version"
+    printf "  ${CLISH_CONSOLE_CORE_INIT_COLOR_GREEN}%-28s${CLISH_CONSOLE_CORE_INIT_COLOR_RESET} %s\n" "-n, --no-interaction" "Do not ask any interactive question"
+    printf "  ${CLISH_CONSOLE_CORE_INIT_COLOR_GREEN}%-28s${CLISH_CONSOLE_CORE_INIT_COLOR_RESET} %s\n" "-v|vv|vvv, --verbose" "Increase the verbosity of messages"
+    # Only show --debug if debug is not explicitly disabled
+    if [[ -z "${CLISH_CONSOLE_CLOSE_DEBUG_ENABLED:-}" ]]; then
+        printf "  ${CLISH_CONSOLE_CORE_INIT_COLOR_GREEN}%-28s${CLISH_CONSOLE_CORE_INIT_COLOR_RESET} %s\n" "--debug" "Enable debug mode (set -x)"
+    fi
+    echo
+    echo "Available commands:"
+    _clish_console_console_help_list_commands
+}
+# ============================================
+# Console Kernel (Strict Namespaced)
+# ============================================
+readonly CLISH_CONSOLE_CONSOLE_KERNEL_BIN_DIR="$PROJECT_ROOT/bin/commands"
+CLISH_CONSOLE_CONSOLE_KERNEL_COMMAND_PATHS=()
+CLISH_CONSOLE_CONSOLE_KERNEL_COMMAND_FILES=()
+_clish_console_console_kernel_build_command_list() {
+    if [[ ! -d "$CLISH_CONSOLE_CONSOLE_KERNEL_BIN_DIR" ]]; then
+        return
+    fi
+    while IFS= read -r file; do
+        if [[ -f "$file" && -x "$file" ]]; then
+            local rel
+            rel="${file#"$CLISH_CONSOLE_CONSOLE_KERNEL_BIN_DIR"/}"
+            CLISH_CONSOLE_CONSOLE_KERNEL_COMMAND_PATHS+=("$rel")
+            CLISH_CONSOLE_CONSOLE_KERNEL_COMMAND_FILES+=("$file")
+        fi
+    done < <(find "$CLISH_CONSOLE_CONSOLE_KERNEL_BIN_DIR" -type f -perm +111 | sort)
+}
+_clish_console_console_kernel_build_command_list
+_clish_console_console_kernel_get_namespace() {
+    local path="$1"
+    local ns="${path//\//_}"
+    echo "cmd_${ns}"
+}
+_clish_console_console_kernel_get_description() {
+    local path="$1"
+    local ns
+    ns="$(_clish_console_console_kernel_get_namespace "$path")"
+    local file="$CLISH_CONSOLE_CONSOLE_KERNEL_BIN_DIR/$path"
+    (
+        # shellcheck source=/dev/null
+        if declare -f "${ns}_description" >/dev/null; then
+            "${ns}_description"
+        fi
+    ) 2>/dev/null
+}
+clish_console_console_kernel_run_command() {
+    clish_console_core_options_clear_registry
+    opt_arguments=()
+    local user_cmd="$1"
+    shift
+    user_cmd="$(echo "$user_cmd" | tr ':' '/')"
+    local ns
+    ns="$(_clish_console_console_kernel_get_namespace "$user_cmd")"
+    if declare -f "${ns}_handle" >/dev/null; then
+        __CLISH_CONSOLE_CONSOLE_KERNEL_CMD_NAME="$user_cmd"
+        if declare -f "${ns}_options" >/dev/null; then
+            "${ns}_options"
+            local opt_spec
+            opt_spec="$(clish_console_core_options_generate_spec)"
+            clish_console_core_options_parse "$opt_spec" "$@"
+        fi
+        # Handle --help (inline mode)
+        if [[ $# -ge 1 && ( "$1" == "-h" || "$1" == "--help" ) ]]; then
+            if declare -f "${ns}_description" >/dev/null; then
+                echo "Usage: $0 $user_cmd"
+                echo
+                "${ns}_description"
+                echo
+            fi
+            if declare -f "${ns}_options" >/dev/null; then
+                clish_console_core_options_clear_registry
+                "${ns}_options"
+                clish_console_core_options_generate_help
+            fi
+            if ! declare -f "${ns}_description" >/dev/null && ! declare -f "${ns}_options" >/dev/null; then
+                echo "No help available for '$user_cmd'"
+            fi
+            return 0
+        fi
+        # Execute command (inline mode)
+        local required_args=${#__CLISH_CONSOLE_CORE_OPTIONS_ARG_NAMES[@]}
+        # shellcheck disable=SC2154
+        local provided_args=${#opt_arguments[@]}
+        if [[ $provided_args -lt $required_args ]]; then
+            clish_console_core_log_error "Missing required argument(s)."
+            clish_console_core_log_error "Expected at least $required_args argument(s), got $provided_args."
+            if [[ "$CLISH_CONSOLE_CORE_INIT_QUIET" != "true" ]]; then
+                echo
+                clish_console_core_options_clear_registry
+                if declare -f "${ns}_options" >/dev/null; then
+                    "${ns}_options" 2>/dev/null
+                    clish_console_core_options_generate_help >&2
+                fi
+            fi
+            return 1
+        fi
+        for i in "${!__CLISH_CONSOLE_CORE_OPTIONS_ARG_NAMES[@]}"; do
+            local arg_name="${__CLISH_CONSOLE_CORE_OPTIONS_ARG_NAMES[$i]}"
+            local arg_value="${opt_arguments[$i]}"
+            printf -v "arg_$arg_name" "%s" "$arg_value"
+        done
+        "${ns}_handle" "$@"
+        return $?
+    fi
+    # Development mode: load from file
+    local cmd_rel=""
+    for path in "${CLISH_CONSOLE_CONSOLE_KERNEL_COMMAND_PATHS[@]}"; do
+        if [[ "$path" == "$user_cmd" ]]; then
+            cmd_rel="$path"
+            break
+        fi
+    done
+    if [[ -z "$cmd_rel" ]]; then
+        clish_console_core_log_error "Command '$user_cmd' not found."
+        clish_console_console_help_show_global_help
+        return 1
+    fi
+    local cmd_file="$CLISH_CONSOLE_CONSOLE_KERNEL_BIN_DIR/$cmd_rel"
+    __CLISH_CONSOLE_CONSOLE_KERNEL_CMD_NAME="$cmd_rel"
+    # shellcheck source=/dev/null
+    if ! source "$cmd_file" 2>/dev/null; then
+        clish_console_core_log_error "Failed to load command: $user_cmd"
+        return 1
+    fi
+    local ns
+    ns="$(_clish_console_console_kernel_get_namespace "$cmd_rel")"
+    if ! declare -f "${ns}_handle" >/dev/null; then
+        clish_console_core_log_error "Command '$user_cmd' does not define ${ns}_handle function."
+        return 1
+    fi
+    # Handle --help (file mode)
+    if [[ $# -ge 1 && ( "$1" == "-h" || "$1" == "--help" ) ]]; then
+        if declare -f "${ns}_description" >/dev/null; then
+            echo "Usage: $0 $user_cmd"
+            echo
+            "${ns}_description"
+            echo
+        fi
+        if declare -f "${ns}_options" >/dev/null; then
+            clish_console_core_options_clear_registry
+            "${ns}_options"
+            clish_console_core_options_generate_help
+        fi
+        if ! declare -f "${ns}_description" >/dev/null && ! declare -f "${ns}_options" >/dev/null; then
+            echo "No help available for '$user_cmd'"
+        fi
+        return 0
+    fi
+    # Execute command (file mode)
+    if declare -f "${ns}_options" >/dev/null; then
+        clish_console_core_options_clear_registry
+        "${ns}_options"
+        local opt_spec
+        opt_spec="$(clish_console_core_options_generate_spec)"
+        clish_console_core_options_parse "$opt_spec" "$@"
+    fi
+    local required_args=${#__CLISH_CONSOLE_CORE_OPTIONS_ARG_NAMES[@]}
+    # shellcheck disable=SC2154
+    local provided_args=${#opt_arguments[@]}
+    if [[ $provided_args -lt $required_args ]]; then
+        clish_console_core_log_error "Missing required argument(s)."
+        clish_console_core_log_error "Expected at least $required_args argument(s), got $provided_args."
+        if [[ "$CLISH_CONSOLE_CORE_INIT_QUIET" != "true" ]]; then
+            echo
+            clish_console_core_options_clear_registry
+            "${ns}_options" 2>/dev/null
+            clish_console_core_options_generate_help >&2
+        fi
+        return 1
+    fi
+    for i in "${!__CLISH_CONSOLE_CORE_OPTIONS_ARG_NAMES[@]}"; do
+        local arg_name="${__CLISH_CONSOLE_CORE_OPTIONS_ARG_NAMES[$i]}"
+        local arg_value="${opt_arguments[$i]}"
+        printf -v "arg_$arg_name" "%s" "$arg_value"
+    done
+    "${ns}_handle" "$@"
+}
+# ============================================
+# Core Initialization (Strict Namespaced)
+# ============================================
+# shellcheck disable=SC2034
+readonly CLISH_CONSOLE_CORE_INIT_COLOR_RESET='\033[0m'
+readonly CLISH_CONSOLE_CORE_INIT_COLOR_GREEN='\033[32m'
+readonly CLISH_CONSOLE_CORE_INIT_COLOR_YELLOW='\033[33m'
+readonly CLISH_CONSOLE_CORE_INIT_COLOR_RED='\033[31m'
+readonly CLISH_CONSOLE_CORE_INIT_COLOR_CYAN='\033[36m'
+readonly CLISH_CONSOLE_CORE_INIT_COLOR_GRAY='\033[90m'
+# These are set by bootstrap
+CLISH_CONSOLE_CORE_INIT_QUIET=${CLISH_CONSOLE_BOOTSTRAP_QUIET:-false}
+CLISH_CONSOLE_CORE_INIT_VERBOSE=${CLISH_CONSOLE_BOOTSTRAP_VERBOSE:-0}
+export CLISH_CONSOLE_CORE_INIT_QUIET
+export CLISH_CONSOLE_CORE_INIT_VERBOSE
+# ============================================
+# Interactive Input Helpers (Strict Namespaced)
+# ============================================
+clish_console_core_input_ask() {
+    local prompt="$1"
+    local default="$2"
+    if [[ -n "$default" ]]; then
+        read -r -p "$prompt [$default]: " answer
+        echo "${answer:-$default}"
+    else
+        read -r -p "$prompt: " answer
+        echo "$answer"
+    fi
+}
+clish_console_core_input_secret() {
+    local prompt="$1"
+    read -r -s -p "$prompt: " answer
+    echo >&2
+    echo "$answer"
+}
+clish_console_core_input_confirm() {
+    local prompt="$1"
+    local default="${2:-n}"
+    local default_upper=""
+    if [[ "$default" == "y" ]]; then
+        default_upper="Y/n"
+    else
+        default_upper="y/N"
+    fi
+    read -r -p "$prompt [$default_upper]: " answer
+    answer="${answer:-$default}"
+    [[ "$answer" =~ ^[Yy]$ ]] && return 0 || return 1
+}
+clish_console_core_input_choice() {
+    local prompt="$1"
+    shift
+    local options=("$@")
+    PS3="$prompt "
+    select opt in "${options[@]}"; do
+        if [[ -n "$opt" ]]; then
+            echo "$opt"
+            break
+        else
+            echo "Invalid option" >&2
+        fi
+    done
+}
+# ============================================
+# Logging Helpers (Strict Namespaced)
+# ============================================
+_clish_console_core_log_message() {
+    # shellcheck disable=SC2034
+    local level="$1"
+    local color="$2"
+    local prefix="$3"
+    shift 3
+    if [[ "$CLISH_CONSOLE_CORE_INIT_QUIET" == "true" ]]; then
+        return 0
+    fi
+    echo -e "${color}${prefix}$*${CLISH_CONSOLE_CORE_INIT_COLOR_RESET}"
+}
+clish_console_core_log_emergency() { _clish_console_core_log_message "EMERGENCY" "$CLISH_CONSOLE_CORE_INIT_COLOR_RED" "[EMERGENCY] " "$@"; }
+clish_console_core_log_alert()     { _clish_console_core_log_message "ALERT"     "$CLISH_CONSOLE_CORE_INIT_COLOR_RED" "[ALERT] "     "$@"; }
+clish_console_core_log_critical()  { _clish_console_core_log_message "CRITICAL"  "$CLISH_CONSOLE_CORE_INIT_COLOR_RED" "[CRITICAL] "  "$@"; }
+clish_console_core_log_error()     { _clish_console_core_log_message "ERROR"     "$CLISH_CONSOLE_CORE_INIT_COLOR_RED" "[ERROR] "     "$@"; }
+clish_console_core_log_warning()   { _clish_console_core_log_message "WARNING"   "$CLISH_CONSOLE_CORE_INIT_COLOR_YELLOW" "[WARNING] " "$@"; }
+clish_console_core_log_notice()    { _clish_console_core_log_message "NOTICE"    "$CLISH_CONSOLE_CORE_INIT_COLOR_CYAN" "[NOTICE] "   "$@"; }
+clish_console_core_log_info()      { _clish_console_core_log_message "INFO"      ""           "[INFO] "      "$@"; }
+clish_console_core_log_debug()     { _clish_console_core_log_message "DEBUG"     "$CLISH_CONSOLE_CORE_INIT_COLOR_GRAY" "[DEBUG] "    "$@"; }
+clish_console_core_log_success() {
+    if [[ "$CLISH_CONSOLE_CORE_INIT_QUIET" != "true" ]]; then
+        echo -e "${CLISH_CONSOLE_CORE_INIT_COLOR_GREEN}$*${CLISH_CONSOLE_CORE_INIT_COLOR_RESET}"
+    fi
+}
+# ============================================
+# Declarative Options & Arguments (Strict Namespaced)
+# ============================================
+__CLISH_CONSOLE_CORE_OPTIONS_OPT_NAMES=()
+__CLISH_CONSOLE_CORE_OPTIONS_OPT_HAS_ARG=()
+__CLISH_CONSOLE_CORE_OPTIONS_OPT_DESC=()
+__CLISH_CONSOLE_CORE_OPTIONS_ARG_NAMES=()
+__CLISH_CONSOLE_CORE_OPTIONS_ARG_DESC=()
+clish_console_core_options_clear_registry() {
+    __CLISH_CONSOLE_CORE_OPTIONS_OPT_NAMES=()
+    __CLISH_CONSOLE_CORE_OPTIONS_OPT_HAS_ARG=()
+    __CLISH_CONSOLE_CORE_OPTIONS_OPT_DESC=()
+    __CLISH_CONSOLE_CORE_OPTIONS_ARG_NAMES=()
+    __CLISH_CONSOLE_CORE_OPTIONS_ARG_DESC=()
+}
+clish_console_core_options_option() {
+    local name="$1"
+    local desc=""
+    local need_arg=false
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --arg) need_arg=true; shift ;;
+            *) desc="$1"; shift ;;
+        esac
+    done
+    __CLISH_CONSOLE_CORE_OPTIONS_OPT_NAMES+=("$name")
+    __CLISH_CONSOLE_CORE_OPTIONS_OPT_HAS_ARG+=("$need_arg")
+    __CLISH_CONSOLE_CORE_OPTIONS_OPT_DESC+=("$desc")
+}
+clish_console_core_options_argument() {
+    local name="$1"
+    local desc="${2:-}"
+    __CLISH_CONSOLE_CORE_OPTIONS_ARG_NAMES+=("$name")
+    __CLISH_CONSOLE_CORE_OPTIONS_ARG_DESC+=("$desc")
+}
+clish_console_core_options_generate_spec() {
+    local spec=""
+    for i in "${!__CLISH_CONSOLE_CORE_OPTIONS_OPT_NAMES[@]}"; do
+        local name="${__CLISH_CONSOLE_CORE_OPTIONS_OPT_NAMES[$i]}"
+        local need_arg="${__CLISH_CONSOLE_CORE_OPTIONS_OPT_HAS_ARG[$i]}"
+        if [[ "$need_arg" == "true" ]]; then
+            spec="$spec ${name}:"
+        else
+            spec="$spec ${name}"
+        fi
+    done
+    spec="${spec# }"
+    echo "$spec"
+}
+clish_console_core_options_generate_help() {
+    if [[ "$CLISH_CONSOLE_CORE_INIT_QUIET" == "true" ]]; then
+        return 1
+    fi
+    local output=""
+    output+="Usage: $(basename "$0") ${__CLISH_CONSOLE_CONSOLE_KERNEL_CMD_NAME:-command}\n"
+    if [[ ${#__CLISH_CONSOLE_CORE_OPTIONS_OPT_NAMES[@]} -gt 0 ]]; then
+        output+="\nOptions:\n"
+        for i in "${!__CLISH_CONSOLE_CORE_OPTIONS_OPT_NAMES[@]}"; do
+            local name="${__CLISH_CONSOLE_CORE_OPTIONS_OPT_NAMES[$i]}"
+            local need_arg="${__CLISH_CONSOLE_CORE_OPTIONS_OPT_HAS_ARG[$i]}"
+            local desc="${__CLISH_CONSOLE_CORE_OPTIONS_OPT_DESC[$i]}"
+            if [[ "$need_arg" == "true" ]]; then
+                output+="  --${name}=<value>    ${desc}\n"
+            else
+                output+="  --${name}            ${desc}\n"
+            fi
+        done
+    fi
+    if [[ ${#__CLISH_CONSOLE_CORE_OPTIONS_ARG_NAMES[@]} -gt 0 ]]; then
+        output+="\nArguments:\n"
+        for i in "${!__CLISH_CONSOLE_CORE_OPTIONS_ARG_NAMES[@]}"; do
+            local name="${__CLISH_CONSOLE_CORE_OPTIONS_ARG_NAMES[$i]}"
+            local desc="${__CLISH_CONSOLE_CORE_OPTIONS_ARG_DESC[$i]}"
+            output+="  ${name}               ${desc}\n"
+        done
+    fi
+    echo -e "$output"
+    return 0
+}
+clish_console_core_options_parse() {
+    local spec="$1"
+    shift
+    # Build normalized option list (replace '-' with '_' in option names)
+    local opts=()
+    for token in $spec; do
+        local opt_name
+        if [[ "$token" == *: ]]; then
+            opt_name="${token%:}"
+        else
+            opt_name="$token"
+        fi
+        # Normalize name
+        opt_name="${opt_name//-/_}"
+        opts+=("$opt_name")
+    done
+    # Clear old option variables (using normalized names)
+    for opt in "${opts[@]}"; do
+        unset "opt_$opt"
+    done
+    local leftover=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --)
+                shift
+                leftover+=("$@")
+                break
+                ;;
+            --*)
+                local raw="${1#--}"
+                local opt="${raw%%=*}"
+                local val="${raw#*=}"
+                # Normalize option name (replace '-' with '_')
+                local opt_underscore="${opt//-/_}"
+                local found=0
+                for declared in "${opts[@]}"; do
+                    if [[ "$declared" == "$opt_underscore" ]]; then
+                        found=1
+                        # Check if argument is required: original spec contains "opt:"
+                        if [[ "$spec" == *"$opt:"* ]]; then
+                            if [[ "$val" != "$raw" ]]; then
+                                printf -v "opt_$opt_underscore" "%s" "$val"
+                            else
+                                shift
+                                printf -v "opt_$opt_underscore" "%s" "$1"
+                            fi
+                        else
+                            printf -v "opt_$opt_underscore" "true"
+                        fi
+                        break
+                    fi
+                done
+                if [[ $found -eq 0 ]]; then
+                    clish_console_core_log_error "Unknown option: --$opt"
+                fi
+                ;;
+            *)
+                leftover+=("$1")
+                ;;
+        esac
+        shift
+    done
+    # shellcheck disable=SC2034
+    opt_arguments=("${leftover[@]}")
+}
+# ============================================
+# Table Output Helper (Strict Namespaced)
+# ============================================
+clish_console_core_output_table() {
+    local -a headers=()
+    local -a rows=()
+    local in_rows=false
+    for arg in "$@"; do
+        if [[ "$arg" == "--" ]]; then
+            in_rows=true
+            continue
+        fi
+        if [[ "$in_rows" == false ]]; then
+            headers+=("$arg")
+        else
+            rows+=("$arg")
+        fi
+    done
+    local -a widths=()
+    for i in "${!headers[@]}"; do
+        widths[i]=${#headers[i]}
+    done
+    for row in "${rows[@]}"; do
+        IFS='|' read -ra cols <<< "$row"
+        for i in "${!cols[@]}"; do
+            if [[ ${#cols[i]} -gt ${widths[i]} ]]; then
+                widths[i]=${#cols[i]}
+            fi
+        done
+    done
+    local header_line=""
+    for i in "${!headers[@]}"; do
+        header_line+="$(printf "%-${widths[i]}s" "${headers[i]}")  "
+    done
+    echo "$header_line"
+    local sep_line=""
+    for i in "${!headers[@]}"; do
+        sep_line+="$(printf "%${widths[i]}s" | tr ' ' '-')  "
+    done
+    echo "$sep_line"
+    for row in "${rows[@]}"; do
+        IFS='|' read -ra cols <<< "$row"
+        local row_line=""
+        for i in "${!cols[@]}"; do
+            row_line+="$(printf "%-${widths[i]}s" "${cols[i]}")  "
+        done
+        echo "$row_line"
+    done
+}
+# ============================================
+# Progress Bar Helpers (Strict Namespaced)
+# ============================================
+__CLISH_CONSOLE_CORE_PROGRESS_CURRENT=0
+__CLISH_CONSOLE_CORE_PROGRESS_TOTAL=0
+__CLISH_CONSOLE_CORE_PROGRESS_LAST_PERCENT=-1
+clish_console_core_progress_start() {
+    local total="$1"
+    __CLISH_CONSOLE_CORE_PROGRESS_CURRENT=0
+    __CLISH_CONSOLE_CORE_PROGRESS_TOTAL=$total
+    __CLISH_CONSOLE_CORE_PROGRESS_LAST_PERCENT=-1
+}
+clish_console_core_progress_advance() {
+    local step="${1:-1}"
+    __CLISH_CONSOLE_CORE_PROGRESS_CURRENT=$((__CLISH_CONSOLE_CORE_PROGRESS_CURRENT + step))
+    local percent=$((__CLISH_CONSOLE_CORE_PROGRESS_CURRENT * 100 / __CLISH_CONSOLE_CORE_PROGRESS_TOTAL))
+    if [[ $percent -ne __CLISH_CONSOLE_CORE_PROGRESS_LAST_PERCENT ]]; then
+        printf "\r[%-50s] %d%%" "$(printf '#%.0s' $(seq 1 $((percent/2))))" "$percent"
+        __CLISH_CONSOLE_CORE_PROGRESS_LAST_PERCENT=$percent
+    fi
+    if [[ __CLISH_CONSOLE_CORE_PROGRESS_CURRENT -eq __CLISH_CONSOLE_CORE_PROGRESS_TOTAL ]]; then
+        echo
+    fi
+}
+# Modulash Aliases - DO NOT EDIT
+__MODULASH_ALIASES=(
+    '@'
+    '@cmd'
+    '@clish/console'
+)
+__MODULASH_PATHS=(
+    './'
+    'bin/commands/'
+    'vendor/clish/console/src/'
+)
+# ============================================
+# Auto-generated Facades - DO NOT EDIT MANUALLY
+# ============================================
+#
+# Edit modulash.json to customize facades, then run dump-autoload again.
+# Example:
+#   "facade": {
+#     "info": "clish_console_core_log_info"      # auto-pass all arguments
+#   }
+# ============================================
+function ask() { clish_console_ask "$@"; }
+export -f ask
+# shellcheck shell=bash
+# Modulash Autoload - DO NOT EDIT
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+_modulash_resolve() {
+    local spec="$1"
+    # Remove quotes
+    spec="${spec#\"}"; spec="${spec%\"}"
+    spec="${spec#\'}"; spec="${spec%\'}"
+    if [[ "$spec" == @* ]]; then
+        # Try longest matching alias
+        local best_alias=""
+        local best_path=""
+        local rest=""
+        for i in "${!__MODULASH_ALIASES[@]}"; do
+            local alias="${__MODULASH_ALIASES[$i]}"
+            # If spec starts with alias (and alias is followed by '/' or end)
+            if [[ "$spec" == "$alias"/* ]] || [[ "$spec" == "$alias" ]]; then
+                # Choose the longest alias
+                if [[ ${#alias} -gt ${#best_alias} ]]; then
+                    best_alias="$alias"
+                    best_path="${__MODULASH_PATHS[$i]}"
+                fi
+            fi
+        done
+        if [[ -n "$best_alias" ]]; then
+            # Extract remaining part
+            if [[ "$spec" == "$best_alias" ]]; then
+                rest=""
+            else
+                # shellcheck disable=SC2295
+                rest="${spec#"$best_alias"/}"
+            fi
+            # Ensure path ends with /
+            [[ "$best_path" != */ ]] && best_path="$best_path/"
+            echo "${best_path}${rest}"
+            return 0
+        else
+            echo "Error: unknown alias (${spec%%/*})" >&2
+            return 1
+        fi
+    else
+        # Relative path, based on caller's directory
+        local caller_dir
+        caller_dir="$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)"
+        echo "$caller_dir/$spec"
+        return 0
+    fi
+}
+import() {
+    local file
+    file="$(_modulash_resolve "$1")" || return $?
+    if [[ ! -f "$file" ]]; then
+        echo "Module not found: $1 -> $file" >&2
+        return 1
+    fi
+    # shellcheck source=/dev/null
+}
+export -f import _modulash_resolve 2>/dev/null || true
+# ============================================
+# Clish — Modulash Console
+# ============================================
+set -eo pipefail
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly PROJECT_ROOT
+# shellcheck disable=SC1091
+clish_console_bootstrap_main "$@"
