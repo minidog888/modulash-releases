@@ -1,7 +1,7 @@
 {
   "stable": {
-    "version": "1.0.0",
-    "download_url": "https://raw.githubusercontent.com/user/modulash-releases/main/releases/modulash-1.0.0",
+    "version": "1.0.1",
+    "download_url": "https://raw.githubusercontent.com/user/modulash-releases/main/releases/modulash-1.0.1",
     "sha256": "19c11296900e807acaaf0cb9aefe581b0626e39b2573ab1d1d90b321dea19570"
   }
 }
